@@ -1,0 +1,18 @@
+services:
+  aerospike:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./conf:/etc/aerospike
+      - ${ASD_BINARY:-./bin/asd}:/usr/bin/asd
+    privileged: true
+    deploy:
+      replicas: ${REPLICAS:-3}
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s

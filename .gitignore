@@ -1,0 +1,28 @@
+# Environment files with local paths
+.env
+
+# License/feature keys (secrets)
+**/features.conf
+
+# Logs and runtime artifacts
+*.log
+log.out
+**/data/
+**/smd/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Scratch/personal files
+fiddle.txt
+skill-dryrun-output.txt
+*.tar
+
+# Editor
+.vscode/
+*.swp
+*~

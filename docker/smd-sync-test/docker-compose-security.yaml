@@ -1,0 +1,57 @@
+# SMD Sync Test - 3-node cluster with SECURITY ENABLED
+# For testing security SMD sync (user/role replication)
+
+services:
+  aerospike-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-sync-test-aerospike-1
+    volumes:
+      - ./conf-security/aerospike-node1.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  aerospike-2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-sync-test-aerospike-2
+    volumes:
+      - ./conf-security/aerospike-node2.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  aerospike-3:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-sync-test-aerospike-3
+    volumes:
+      - ./conf-security/aerospike-node3.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s

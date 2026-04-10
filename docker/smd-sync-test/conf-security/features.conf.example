@@ -1,0 +1,8 @@
+# Aerospike Enterprise Feature Key File
+#
+# Copy your valid features.conf here:
+#   cp /path/to/your/features.conf features.conf
+#
+# Get a trial key from: https://aerospike.com/download/
+#
+# This file is gitignored - do not commit real keys.
