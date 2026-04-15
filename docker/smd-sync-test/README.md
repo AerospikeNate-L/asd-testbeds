@@ -131,6 +131,57 @@ If you see this warning, there's a problem:
 WARNING (smd): SMD sync timed out after 30 seconds - proceeding anyway
 ```
 
+## Timing Tests
+
+Measures SMD full-sync time as a function of payload size. Uses pre-seeded `.smd`
+JSON files injected directly into the principal's work directory before node start,
+bypassing `asinfo` entirely to reach MB–100 MB scale quickly.
+
+### Quick Start
+
+```bash
+# Default sweep: 10K, 50K, 100K items at 200B/value (~3–38 MB)
+export ASD_BINARY=/path/to/asd
+./test-smd-sync.sh timing
+
+# Custom sweep: larger items
+TIMING_ITEMS="10000 50000 100000" TIMING_VALUE_SIZE=1024 ./test-smd-sync.sh timing
+
+# Results are written to ./timing-results/timing-YYYYMMDD-HHMMSS.tsv
+```
+
+### What Gets Measured
+
+| Metric | Source |
+|--------|--------|
+| `wall_cluster_ms` | Wall-clock ms from container start until `cluster_size=3` |
+| `sync_elapsed_us` | Microseconds from SMD sync log: `initial SMD sync wait done - elapsed NNN us` (service-start path) or `sync wait done cl_key … elapsed NNN us` (partition-balance path) |
+
+### Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `TIMING_ITEMS` | `"10000 50000 100000"` | Space-separated item counts to sweep |
+| `TIMING_VALUE_SIZE` | `200` | Bytes per SMD value string |
+| `SMD_DATA_DIR` | `/tmp/smd-timing-data` | Host directory for per-node smd bind mounts |
+| `TIMING_RESULTS_DIR` | `./timing-results` | Where TSV results are written |
+
+### File Layout
+
+```
+gen-large-smd.py          -- generates .smd JSON for any item count
+docker-compose-timing.yaml -- 3-node compose with per-node smd bind mounts
+timing-results/           -- TSV output from timing runs
+```
+
+### How It Works
+
+1. `gen-large-smd.py` writes `${SMD_DATA_DIR}/node1/smd/sindex.smd` with N items.
+2. Nodes 2 & 3 get empty smd dirs — they start with no local SMD.
+3. When the cluster forms, node 1 (principal, lowest node-id `a1`) must
+   full-sync its entire DB to nodes 2 and 3 via `module_fill_msg` → fabric msgpack.
+4. The test captures the elapsed time from the server's own sync-completion log.
+
 ## Limitations
 
 SMD sync completing does **not** guarantee all subsystems are fully ready:

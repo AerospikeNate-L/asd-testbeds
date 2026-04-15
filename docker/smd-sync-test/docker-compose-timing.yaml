@@ -1,0 +1,89 @@
+# SMD Timing Test - 3-node cluster with per-node smd bind mounts
+#
+# Each node's /opt/aerospike/smd is bind-mounted from the host at:
+#   ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node{1,2,3}/smd
+#
+# This lets the test pre-seed node 1's SMD with a large payload before
+# starting the cluster, leaving nodes 2 and 3 empty.
+#
+# The node configs hardcode mesh seeds as "smd-sync-test-aerospike-{1,2,3}".
+# Service aliases make those names resolvable within this project's network
+# without having to duplicate the conf files.
+#
+# Usage (set by test script):
+#   SMD_DATA_DIR=/tmp/smd-timing-data  ASD_BINARY=/path/to/asd
+#   docker compose -f docker-compose-timing.yaml -p smd-timing up -d
+
+networks:
+  smd-timing-net:
+    driver: bridge
+
+services:
+  aerospike-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-timing-aerospike-1
+    networks:
+      smd-timing-net:
+        aliases:
+          - smd-sync-test-aerospike-1
+    volumes:
+      - ./conf/aerospike-node1.conf:/etc/aerospike/aerospike.conf
+      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/smd:/opt/aerospike/smd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  aerospike-2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-timing-aerospike-2
+    networks:
+      smd-timing-net:
+        aliases:
+          - smd-sync-test-aerospike-2
+    volumes:
+      - ./conf/aerospike-node2.conf:/etc/aerospike/aerospike.conf
+      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/smd:/opt/aerospike/smd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  aerospike-3:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: smd-timing-aerospike-3
+    networks:
+      smd-timing-net:
+        aliases:
+          - smd-sync-test-aerospike-3
+    volumes:
+      - ./conf/aerospike-node3.conf:/etc/aerospike/aerospike.conf
+      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/smd:/opt/aerospike/smd
+    privileged: true
+    command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s

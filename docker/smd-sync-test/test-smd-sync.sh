@@ -372,6 +372,209 @@ test_principal_pulls_from_npr() {
     log "Test 5 complete"
 }
 
+# ---------------------------------------------------------------------------
+# SMD Timing Tests
+# ---------------------------------------------------------------------------
+#
+# Measures how long SMD full-sync takes as a function of payload size.
+#
+# Strategy:
+#   1. Use gen-large-smd.py to write a pre-seeded .smd file for node 1 (principal).
+#   2. Start all 3 nodes via docker-compose-timing.yaml, which bind-mounts per-node
+#      smd directories from the host (nodes 2 & 3 start empty).
+#   3. Measure two things:
+#        a) Wall-clock seconds until cluster_size=3 is reported by node 1.
+#        b) SMD sync elapsed microseconds from the "sync wait done elapsed NNN us"
+#           debug log line emitted by as_smd_wait_ready().
+#
+# The test iterates over a configurable list of item counts (TIMING_ITEMS).
+
+TIMING_PROJECT="smd-timing"
+TIMING_COMPOSE="docker-compose-timing.yaml"
+SMD_DATA_DIR="${SMD_DATA_DIR:-/tmp/smd-timing-data}"
+TIMING_MODULE="evict"          # evict module: no key format validation, clean logs
+TIMING_VALUE_SIZE="${TIMING_VALUE_SIZE:-200}"  # bytes per value (default ~200B)
+TIMING_ITEMS="${TIMING_ITEMS:-10000 50000 100000 200000 300000 400000}"  # item counts to sweep
+
+# Ensure results dir exists
+TIMING_RESULTS_DIR="${TIMING_RESULTS_DIR:-./timing-results}"
+
+timing_log() {
+    echo "[$(date '+%H:%M:%S')] [timing] $*"
+}
+
+# Tear down timing cluster completely
+timing_teardown() {
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT down -v 2>/dev/null || true
+}
+
+# Seed node 1's smd dir with a generated .smd file; clear nodes 2 & 3.
+timing_seed_smd() {
+    local n_items=$1
+
+    timing_log "Seeding SMD: module=$TIMING_MODULE  items=$n_items  value_size=${TIMING_VALUE_SIZE}B"
+
+    # Prepare per-node smd directories
+    for node in 1 2 3; do
+        rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+    done
+
+    # Generate the .smd file for node 1 (principal)
+    python3 "$(dirname "$0")/gen-large-smd.py" \
+        --items "$n_items" \
+        --module "$TIMING_MODULE" \
+        --value-size "$TIMING_VALUE_SIZE" \
+        --out "${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd"
+
+    local smd_file="${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd"
+    local smd_size
+    smd_size=$(du -sh "$smd_file" 2>/dev/null | cut -f1)
+    timing_log "Node 1 SMD file: $smd_file ($smd_size)"
+}
+
+# Wait for cluster_size=N on node 1, return elapsed wall-clock milliseconds.
+# All log output goes to stderr; only the numeric result is printed to stdout.
+timing_wait_cluster() {
+    local expected_size=$1
+    local timeout=${2:-120}
+    local t_start
+    t_start=$(date +%s%N)
+    local elapsed=0
+
+    timing_log "Waiting for cluster size $expected_size (timeout: ${timeout}s)..." >&2
+
+    while [ $elapsed -lt $timeout ]; do
+        local size
+        size=$(docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
+               | grep -oP 'cluster_size=\K\d+' || echo "0")
+        if [ "$size" = "$expected_size" ]; then
+            local t_end
+            t_end=$(date +%s%N)
+            local wall_ms=$(( (t_end - t_start) / 1000000 ))
+            timing_log "Cluster formed (size $size) in ${wall_ms} ms" >&2
+            echo "$wall_ms"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    timing_log "ERROR: Cluster did not reach size $expected_size within ${timeout}s" >&2
+    echo "-1"
+    return 1
+}
+
+# Extract SMD sync elapsed time from node 1 logs.
+# Checks two log lines (both emitted under "context smd debug"):
+#
+#   as_smd_wait_ready (INFO, fresh node/service start):
+#     "initial SMD sync wait done - elapsed NNN us"
+#
+#   as_smd_cluster_changed_sync (DEBUG, partition balance path):
+#     "sync wait done cl_key XXXX elapsed NNN us"
+#
+# Returns the largest elapsed microsecond value found (the binding sync wait),
+# or -1 if neither is present.
+timing_extract_sync_us() {
+    local logs
+    logs=$(docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1)
+
+    # Match both formats; pick the last (largest elapsed) value seen.
+    local sync_us
+    sync_us=$(echo "$logs" \
+        | grep -oP '(?:initial SMD sync wait done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
+        | sort -n | tail -1)
+
+    if [ -n "$sync_us" ]; then
+        echo "$sync_us"
+    else
+        echo "-1"
+    fi
+}
+
+# Run a single timing measurement for a given item count.
+# Appends one TSV data row to the provided results file.
+timing_run_one() {
+    local n_items=$1
+    local results_file=$2
+
+    timing_teardown
+
+    timing_seed_smd "$n_items"
+
+    local smd_mb
+    smd_mb=$(python3 -c "import os; print(f'{os.path.getsize(\"${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd\") / 1048576:.2f}')")
+
+    timing_log "Starting 3-node cluster (n_items=$n_items, ~${smd_mb} MB)..."
+
+    export SMD_DATA_DIR ASD_BINARY
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 300)
+
+    local sync_us
+    sync_us=$(timing_extract_sync_us)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: cluster did not form for n_items=$n_items"
+        timing_teardown
+        return 1
+    fi
+
+    local sync_ms="n/a"
+    if [ "$sync_us" != "-1" ]; then
+        sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+    fi
+
+    # Check whether the server hit its 30s SMD sync timeout
+    local timed_out=0
+    if docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1 \
+            | grep -q "SMD sync timed out\|initial SMD sync timed out"; then
+        timed_out=1
+        timing_log "WARNING: SMD sync timed out on node 1!"
+    fi
+
+    timing_log "RESULT: items=$n_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+
+    echo -e "${n_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
+
+    # Capture phase-timing log lines before containers are torn down.
+    local phase_log="${results_file%.tsv}-phases.log"
+    timing_log "Capturing phase timing to $phase_log..."
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs 2>&1 \
+        | grep -E "full-to-pr timing|full-from-pr timing" \
+        | sed "s/^/[n=${n_items}] /" >> "$phase_log"
+
+    timing_teardown
+}
+
+test_large_smd_timing() {
+    timing_log "=== SMD Large-Payload Timing Sweep ==="
+    timing_log "Sweep: items=${TIMING_ITEMS}  value_size=${TIMING_VALUE_SIZE}B"
+    timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+    mkdir -p "$TIMING_RESULTS_DIR"
+    local results_file="${TIMING_RESULTS_DIR}/timing-$(date '+%Y%m%d-%H%M%S').tsv"
+    echo -e "items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tvalue_size_b\tsync_timeout" > "$results_file"
+    timing_log "Results file: $results_file"
+
+    local failed=0
+    for n in $TIMING_ITEMS; do
+        timing_run_one "$n" "$results_file" || failed=1
+    done
+
+    if [ $failed -eq 0 ]; then
+        timing_log "=== Timing sweep COMPLETE ==="
+        timing_log "Summary ($results_file):"
+        column -t "$results_file"
+    else
+        timing_log "=== Timing sweep had FAILURES ==="
+        return 1
+    fi
+}
+
 cleanup() {
     log "Stopping containers (preserving for log inspection)..."
     docker compose -p $COMPOSE_PROJECT stop 2>/dev/null || true
@@ -420,24 +623,41 @@ case "${1:-all}" in
             exit 1
         fi
         ;;
+    timing)
+        test_large_smd_timing
+        ;;
     cleanup)
         cleanup
         ;;
     cleanup-full)
         cleanup_full
         ;;
+    timing-cleanup)
+        timing_teardown
+        ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|cleanup|cleanup-full}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|cleanup|cleanup-full|timing-cleanup}"
         echo ""
-        echo "Options:"
+        echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
         echo "  auth        - Test security authentication (requires security config)"
         echo "  rejoin      - Test NPR rejoin with cleared SMD"
         echo "  preexisting - Test principal with SMD, NPRs empty"
         echo "  pull        - Test principal empty, must pull from NPRs"
-        echo "  all         - Run all tests"
-        echo "  cleanup     - Stop containers (preserve for log inspection)"
-        echo "  cleanup-full - Remove containers and volumes"
+        echo "  all         - Run all correctness tests"
+        echo ""
+        echo "Timing tests:"
+        echo "  timing      - Sweep large SMD payloads and measure sync time"
+        echo "                Tune with env vars:"
+        echo "                  TIMING_ITEMS='10000 50000 100000'  (item counts)"
+        echo "                  TIMING_VALUE_SIZE=200               (bytes per value)"
+        echo "                  TIMING_RESULTS_DIR=./timing-results (output dir)"
+        echo "                  SMD_DATA_DIR=/tmp/smd-timing-data   (host smd dirs)"
+        echo ""
+        echo "Cleanup:"
+        echo "  cleanup        - Stop correctness test containers (preserve for inspection)"
+        echo "  cleanup-full   - Remove correctness test containers and volumes"
+        echo "  timing-cleanup - Remove timing test containers and volumes"
         echo ""
         echo "Environment:"
         echo "  ASD_BINARY         - Path to asd binary (required)"
