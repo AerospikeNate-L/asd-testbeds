@@ -131,6 +131,38 @@ If you see this warning, there's a problem:
 WARNING (smd): SMD sync timed out after 30 seconds - proceeding anyway
 ```
 
+## Limitations
+
+SMD sync completing does **not** guarantee all subsystems are fully ready:
+
+| Module | What SMD Sync Guarantees | What It Does NOT Guarantee |
+|--------|--------------------------|----------------------------|
+| **Sindex** | Index definition exists on all nodes | Index is populated and queryable |
+| **UDF** | UDF files written to disk | Lua modules compiled |
+| **Security** | Users/roles replicated | N/A - immediately usable |
+| **Roster** | Roster config replicated | N/A - immediately usable |
+| **XDR** | DC configs replicated | Connections established |
+
+### Secondary Index Caveat
+
+This is the most significant limitation. After SMD sync completes:
+1. The sindex **definition** exists on the node
+2. The sindex **data structure** is created
+3. But `si->readable = false` until population completes
+
+Population scans all records in the namespace/set, which can take significant time
+for large datasets. Until population completes, queries against the sindex will
+return incomplete results.
+
+**To check sindex readiness:**
+```bash
+asinfo -v 'sindex-list:ns=test'
+# Look for sync_state=synced (definition synced) vs actual population status
+```
+
+The sync only ensures metadata is consistent across nodes before partition
+balance runs - it does not wait for background initialization tasks.
+
 ## Environment Variables
 
 | Variable | Description |
