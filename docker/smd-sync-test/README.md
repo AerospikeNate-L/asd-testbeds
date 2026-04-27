@@ -6,11 +6,13 @@ particularly with heterogeneous SMD state (e.g., nodes with different security/R
 ## Deterministic Principal Selection
 
 Each node has a fixed `node-id` in its config:
-- **Node 1**: `a1` (lowest - always principal)
+- **Node 1**: `a1` (lowest)
 - **Node 2**: `a2`
-- **Node 3**: `a3` (highest - always NPR)
+- **Node 3**: `a3` (highest - always principal)
 
-This ensures tests are deterministic and repeatable.
+Aerospike sorts the succession list in **descending** order by node-id, so the
+**highest** node-id becomes principal (first in succession list). This ensures
+tests are deterministic and repeatable.
 
 ## Test Scenarios
 
@@ -18,9 +20,9 @@ This ensures tests are deterministic and repeatable.
 |------|-------------|
 | `basic` | Fresh 3-node cluster, verify SMD sync completes before partition balance |
 | `auth` | Security authentication works immediately after cluster start (requires security config) |
-| `rejoin` | NPR (node 3) rejoins with cleared SMD, syncs from principal |
-| `preexisting` | Principal (node 1) has SMD data, NPRs start empty |
-| `pull` | Principal (node 1) starts empty, must pull SMD from NPRs |
+| `rejoin` | Node 3 (principal) rejoins with cleared SMD, syncs from other nodes |
+| `preexisting` | Node 1 starts first with SMD data, nodes 2 and 3 join empty |
+| `pull` | Nodes 2 and 3 start with SMD, node 1 joins and receives SMD |
 
 ## Prerequisites
 
@@ -76,33 +78,33 @@ and verifies authentication works on nodes 2 and 3.
 **Note:** Uses separate `docker-compose-security.yaml` with security-enabled configs.
 Run separately with `./test-smd-sync.sh auth`.
 
-### Test 3: NPR Rejoin (`rejoin`)
+### Test 3: Node Rejoin (`rejoin`)
 
-Tests that an NPR with cleared SMD syncs correctly when rejoining.
+Tests that a node with cleared SMD syncs correctly when rejoining.
 
 **Scenario:**
 1. 3-node cluster running with sindex
-2. Stop node 3 (NPR), clear its SMD
+2. Stop node 3 (principal), clear its SMD
 3. Restart node 3
 4. Verify node 3 gets the sindex via SMD sync
 
-### Test 4: Principal Has SMD (`preexisting`)
+### Test 4: First Node Has SMD (`preexisting`)
 
-Tests the common case where principal has data and NPRs are empty.
+Tests the case where the first node has SMD data and others join empty.
 
 **Scenario:**
 1. Start node 1 alone, create sindex
 2. Start nodes 2 and 3 (fresh, no SMD)
 3. Verify all nodes get the sindex
 
-### Test 5: Principal Pulls from NPR (`pull`)
+### Test 5: New Node Joins Existing Cluster (`pull`)
 
-Tests the STATE_DIRTY path where principal must pull data from NPRs.
+Tests that a new node joining an existing cluster receives SMD.
 
 **Scenario:**
 1. Start nodes 2 and 3, create sindex
-2. Start node 1 (fresh, becomes principal due to lowest node-id)
-3. Verify node 1 pulls sindex from NPRs
+2. Start node 1 (fresh, joins existing cluster)
+3. Verify node 1 receives sindex via SMD sync
 4. Verify all nodes have the sindex
 
 ## Configuration Files

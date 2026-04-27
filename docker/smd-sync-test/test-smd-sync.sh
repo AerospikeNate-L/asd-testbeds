@@ -2,10 +2,10 @@
 # SMD Sync Test Script
 # Tests that SMD synchronization completes before partition balance
 #
-# Node IDs are deterministic:
-#   Node 1: a1 (lowest - always principal)
+# Node IDs are deterministic (succession sorted descending, so highest is principal):
+#   Node 1: a1 (lowest)
 #   Node 2: a2
-#   Node 3: a3 (highest - always NPR)
+#   Node 3: a3 (highest - always principal)
 
 set -e
 
@@ -33,13 +33,27 @@ stop_nodes() {
     done
 }
 
-# Clear SMD on specific node (must be stopped first, will restart briefly)
+# Clear SMD on specific node (must be stopped first).
+# Uses a temporary container to clear the SMD volume without starting the server.
 clear_smd() {
     local node=$1
-    docker start ${COMPOSE_PROJECT}-aerospike-$node 2>/dev/null || true
-    sleep 1
-    docker exec ${COMPOSE_PROJECT}-aerospike-$node rm -rf /opt/aerospike/smd/* 2>/dev/null || true
-    docker stop ${COMPOSE_PROJECT}-aerospike-$node
+    local container="${COMPOSE_PROJECT}-aerospike-$node"
+    
+    # Get the SMD volume mount from the stopped container
+    local smd_mount
+    smd_mount=$(docker inspect "$container" 2>/dev/null | \
+        grep -oP '"/opt/aerospike/smd":\s*\{\s*"Source":\s*"\K[^"]+' || true)
+    
+    if [ -n "$smd_mount" ] && [ -d "$smd_mount" ]; then
+        # Clear from host if we have access to the bind mount
+        rm -rf "${smd_mount:?}"/* 2>/dev/null || true
+        log "Cleared SMD via host mount: $smd_mount"
+    else
+        # Fallback: use a temporary alpine container to clear the volume
+        # This avoids starting the aerospike server process
+        docker run --rm --volumes-from "$container" alpine sh -c "rm -rf /opt/aerospike/smd/*" 2>/dev/null || true
+        log "Cleared SMD via temporary container"
+    fi
 }
 
 wait_for_cluster() {
@@ -50,8 +64,9 @@ wait_for_cluster() {
     log "Waiting for cluster size $expected_size (timeout: ${timeout}s)..."
     
     while [ $elapsed -lt $timeout ]; do
-        # Use admin user if security is enabled, fall back to unauthenticated
-        size=$(docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
+        # Use admin user if security is enabled, fall back to unauthenticated.
+        # Timeout guards against connection accepted but not yet processed.
+        size=$(timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "$expected_size" ]; then
             log "Cluster formed with size $size"
             return 0
@@ -123,7 +138,8 @@ test_security_auth() {
     log "Waiting for cluster size 3 (timeout: ${TIMEOUT}s)..."
     local elapsed=0
     while [ $elapsed -lt $TIMEOUT ]; do
-        size=$(docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -Uadmin -Padmin -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
+        # Timeout guards against connection accepted but not yet processed.
+        size=$(timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -Uadmin -Padmin -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "3" ]; then
             log "Cluster formed with size $size"
             break
@@ -168,7 +184,7 @@ test_security_auth() {
 }
 
 test_node_rejoin() {
-    log "=== Test 3: NPR Rejoin with Cleared SMD ==="
+    log "=== Test 3: Node Rejoin with Cleared SMD ==="
     
     # Ensure cluster is running with user
     wait_for_cluster 3 30 || {
@@ -181,8 +197,8 @@ test_node_rejoin() {
     docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "sindex-create:ns=test;set=demo;indexname=rejoin_idx;bin=rejoin;type=string" 2>/dev/null || true
     sleep 2
     
-    # Stop node 3 (NPR)
-    log "Stopping node 3 (NPR)..."
+    # Stop node 3 (principal - highest node-id)
+    log "Stopping node 3 (principal)..."
     stop_nodes 3
     sleep 3
     
@@ -217,7 +233,7 @@ test_node_rejoin() {
 }
 
 test_preexisting_smd() {
-    log "=== Test 4: Principal (Node 1) Has SMD, NPRs Empty ==="
+    log "=== Test 4: First Node Has SMD, Others Join Empty ==="
     
     # Clean start - bring up node 1 only to create SMD
     docker compose -p $COMPOSE_PROJECT down -v 2>/dev/null || true
@@ -225,10 +241,10 @@ test_preexisting_smd() {
     log "Starting node 1 alone to create SMD data..."
     start_nodes 1
     
-    # Wait for node 1
+    # Wait for node 1. Timeout guards against connection accepted but not yet processed.
     local elapsed=0
     while [ $elapsed -lt 30 ]; do
-        if docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "build" 2>/dev/null | grep -q "8."; then
+        if timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "build" 2>/dev/null | grep -q "8."; then
             break
         fi
         sleep 2
@@ -291,10 +307,10 @@ cleanup() {
 }
 
 test_principal_pulls_from_npr() {
-    log "=== Test 5: Principal (Node 1) Empty, Must Pull from NPR ==="
+    log "=== Test 5: New Node Joins Existing Cluster with SMD ==="
     
-    # Node 1 is always principal (lowest node-id: a1)
-    # This tests the STATE_DIRTY path where principal pulls from NPRs
+    # Node 3 (highest node-id: a3) is principal once cluster forms.
+    # This tests that a new node joining gets SMD from existing nodes.
     
     # Clean start
     docker compose -p $COMPOSE_PROJECT down -v 2>/dev/null || true
@@ -303,10 +319,11 @@ test_principal_pulls_from_npr() {
     log "Starting nodes 2 and 3 to create SMD data..."
     start_nodes 2 3
     
-    # Wait for 2-node cluster (node 2 will be principal temporarily)
+    # Wait for 2-node cluster (node 3 is principal - highest node-id).
+    # Timeout guards against connection accepted but not yet processed.
     local elapsed=0
     while [ $elapsed -lt 60 ]; do
-        size=$(docker exec ${COMPOSE_PROJECT}-aerospike-2 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
+        size=$(timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-2 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "2" ]; then
             log "2-node cluster formed (nodes 2,3)"
             break
@@ -329,19 +346,19 @@ test_principal_pulls_from_npr() {
         fi
     done
     
-    # Now start node 1 (fresh, no SMD) - it becomes principal due to lowest node-id
-    log "Starting node 1 (fresh, will become principal)..."
+    # Now start node 1 (fresh, no SMD) - it joins and gets SMD from existing nodes
+    log "Starting node 1 (fresh, joining existing cluster)..."
     start_nodes 1
     
     # Wait for 3-node cluster
     wait_for_cluster 3 $TIMEOUT
     
-    # Verify node 1 is principal
+    # Log principal for debugging (should be A3 - highest node-id)
     principal=$(docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_principal=\K[A-F0-9]+')
     node1_id=$(docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "node" 2>/dev/null)
     log "Principal: $principal, Node 1 ID: $node1_id"
     
-    # Verify all nodes have the sindex (node 1 must have pulled from NPRs)
+    # Verify all nodes have the sindex (node 1 must have received SMD on join)
     log "Verifying SMD synced to all nodes..."
     local all_have_sindex=true
     for i in 1 2 3; do
@@ -354,7 +371,7 @@ test_principal_pulls_from_npr() {
     done
     
     if $all_have_sindex; then
-        log "PASS: Principal pulled SMD from NPRs successfully"
+        log "PASS: New node received SMD on cluster join"
     else
         log "FAIL: SMD not synced to all nodes"
         return 1
@@ -379,7 +396,7 @@ test_principal_pulls_from_npr() {
 # Measures how long SMD full-sync takes as a function of payload size.
 #
 # Strategy:
-#   1. Use gen-large-smd.py to write a pre-seeded .smd file for node 1 (principal).
+#   1. Use gen-large-smd.py to write a pre-seeded .smd file for node 1.
 #   2. Start all 3 nodes via docker-compose-timing.yaml, which bind-mounts per-node
 #      smd directories from the host (nodes 2 & 3 start empty).
 #   3. Measure two things:
@@ -420,7 +437,7 @@ timing_seed_smd() {
         mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
     done
 
-    # Generate the .smd file for node 1 (principal)
+    # Generate the .smd file for node 1
     python3 "$(dirname "$0")/gen-large-smd.py" \
         --items "$n_items" \
         --module "$TIMING_MODULE" \
@@ -445,8 +462,9 @@ timing_wait_cluster() {
     timing_log "Waiting for cluster size $expected_size (timeout: ${timeout}s)..." >&2
 
     while [ $elapsed -lt $timeout ]; do
+        # Timeout guards against connection accepted but not yet processed.
         local size
-        size=$(docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
+        size=$(timeout 5 docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
                | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "$expected_size" ]; then
             local t_end
@@ -641,9 +659,9 @@ case "${1:-all}" in
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
         echo "  auth        - Test security authentication (requires security config)"
-        echo "  rejoin      - Test NPR rejoin with cleared SMD"
-        echo "  preexisting - Test principal with SMD, NPRs empty"
-        echo "  pull        - Test principal empty, must pull from NPRs"
+        echo "  rejoin      - Test node rejoin with cleared SMD"
+        echo "  preexisting - Test first node with SMD, others join empty"
+        echo "  pull        - Test new node joins cluster with existing SMD"
         echo "  all         - Run all correctness tests"
         echo ""
         echo "Timing tests:"
