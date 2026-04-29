@@ -29,15 +29,17 @@ import time
 BASE_TS = 1700000000000  # fixed ms timestamp so items look "real"
 
 
-def build_smd(module: str, n_items: int, value_size: int) -> list:
+def build_smd(module: str, n_items: int, value_size: int, key_prefix: str = "",
+              generation: int = 1, ts_offset: int = 0) -> list:
     items = [[0, 1]]  # cv_key=0, cv_tid=1
     value_template = ("x" * value_size)
+    prefix = f"{key_prefix}{module}" if key_prefix else module
     for i in range(n_items):
         items.append({
-            "key": f"{module}-key-{i:08d}",
+            "key": f"{prefix}-key-{i:08d}",
             "value": value_template,
-            "generation": 1,
-            "timestamp": BASE_TS + i,
+            "generation": generation,
+            "timestamp": BASE_TS + ts_offset + i,
         })
     return items
 
@@ -47,13 +49,17 @@ def main():
     parser.add_argument("--items", type=int, default=10000, help="Number of SMD items")
     parser.add_argument("--module", default="sindex", help="Module name (used as key prefix)")
     parser.add_argument("--value-size", type=int, default=200, help="Bytes per value string")
+    parser.add_argument("--key-prefix", default="", help="Prefix for keys (e.g., 'n1_' for node 1)")
+    parser.add_argument("--generation", type=int, default=1, help="Generation number for all items")
+    parser.add_argument("--ts-offset", type=int, default=0, help="Offset added to timestamps")
     parser.add_argument("--out", required=True, help="Output .smd file path")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     t0 = time.monotonic()
-    data = build_smd(args.module, args.items, args.value_size)
+    data = build_smd(args.module, args.items, args.value_size, args.key_prefix,
+                     args.generation, args.ts_offset)
     build_ms = (time.monotonic() - t0) * 1000
 
     save_path = args.out + ".save"

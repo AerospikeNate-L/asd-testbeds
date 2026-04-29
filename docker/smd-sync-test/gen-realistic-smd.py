@@ -308,8 +308,9 @@ def build_security_smd(n_items: int, max_size: bool = False) -> list:
         role_names.append(role_name)
         
         # Role privilege entries: |R|role|V|perm|ns|set
+        # Use "test" namespace to match test config (server validates ns exists)
         for priv_idx in range(3):  # 3 privs per role
-            ns_name = generate_ns_name(priv_idx % MAX_NAMESPACES, max_len=True)
+            ns_name = "test"
             set_name = generate_set_name(priv_idx, max_len=True) if priv_idx > 0 else ""
             perm_code = 10 + priv_idx  # read=10, write=11, etc.
             key = f"|R|{role_name}|V|{perm_code}|{ns_name}|{set_name}"
@@ -333,9 +334,9 @@ def build_security_smd(n_items: int, max_size: bool = False) -> list:
         })
         idx += 1
         
-        # Role quotas: |R|role|Q|r and |R|role|Q|w
-        for quota_type in ['r', 'w']:
-            key = f"|R|{role_name}|Q|{quota_type}"
+        # Role quotas: |R|role|E (read) and |R|role|I (write)
+        for quota_tok in ['E', 'I']:
+            key = f"|R|{role_name}|{quota_tok}"
             items.append({
                 "key": key,
                 "value": "10000",  # TPS quota

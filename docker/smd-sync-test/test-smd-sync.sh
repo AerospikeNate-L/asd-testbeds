@@ -64,9 +64,10 @@ wait_for_cluster() {
     log "Waiting for cluster size $expected_size (timeout: ${timeout}s)..."
     
     while [ $elapsed -lt $timeout ]; do
-        # Use admin user if security is enabled, fall back to unauthenticated.
+        # Try with auth first (for security-enabled clusters), fall back to unauthenticated.
         # Timeout guards against connection accepted but not yet processed.
-        size=$(timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
+        size=$(timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -Uadmin -Padmin -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || \
+               timeout 5 docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "$expected_size" ]; then
             log "Cluster formed with size $size"
             return 0
@@ -440,10 +441,12 @@ timing_seed_smd() {
 
     timing_log "Seeding SMD: module=$TIMING_MODULE  items=$n_items  value_size=${TIMING_VALUE_SIZE}B"
 
-    # Prepare per-node smd directories
+    # Prepare per-node smd and log directories
     for node in 1 2 3; do
         rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        rm -rf "${SMD_DATA_DIR}/node${node}/log"
         mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/log"
     done
 
     # Generate the .smd file for node 1
@@ -472,8 +475,11 @@ timing_wait_cluster() {
 
     while [ $elapsed -lt $timeout ]; do
         # Timeout guards against connection accepted but not yet processed.
+        # Try with auth first (for security-enabled clusters), fall back to unauthenticated.
         local size
-        size=$(timeout 5 docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
+        size=$(timeout 5 docker exec smd-timing-aerospike-1 asinfo -Uadmin -Padmin -v "statistics" 2>/dev/null \
+               | grep -oP 'cluster_size=\K\d+' || \
+               timeout 5 docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
                | grep -oP 'cluster_size=\K\d+' || echo "0")
         if [ "$size" = "$expected_size" ]; then
             local t_end
@@ -634,10 +640,12 @@ timing_real_seed_smd() {
 
     timing_log "Seeding realistic SMD: modules=[$modules]  max_size=$max_size"
 
-    # Prepare per-node smd directories
+    # Prepare per-node smd and log directories
     for node in 1 2 3; do
         rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        rm -rf "${SMD_DATA_DIR}/node${node}/log"
         mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/log"
     done
 
     # Generate .smd files for node 1
@@ -757,6 +765,426 @@ timing_real_run() {
     timing_teardown
 }
 
+# ---------------------------------------------------------------------------
+# Conflict Timing Tests (timing-conflict)
+# ---------------------------------------------------------------------------
+#
+# Tests worst-case merge scenarios where all nodes have different SMD data.
+# Two modes:
+#   - "disjoint": Each node has unique keys (no overlap) - tests hash insertion
+#   - "conflict": All nodes have same keys, different generations - tests conflict resolution
+#
+# This is the worst case for the merge algorithm.
+
+TIMING_CONFLICT_MODE="${TIMING_CONFLICT_MODE:-disjoint}"  # disjoint or conflict
+TIMING_CONFLICT_ITEMS="${TIMING_CONFLICT_ITEMS:-50000}"   # items per node
+
+# Seed all 3 nodes with different SMD data
+timing_conflict_seed_smd() {
+    local mode="$1"
+    local items_per_node="$2"
+
+    timing_log "Seeding conflict SMD: mode=$mode  items_per_node=$items_per_node"
+
+    # Prepare per-node smd and log directories
+    for node in 1 2 3; do
+        rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        rm -rf "${SMD_DATA_DIR}/node${node}/log"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/log"
+    done
+
+    if [ "$mode" = "disjoint" ]; then
+        # Each node gets unique keys: n1_evict-key-*, n2_evict-key-*, n3_evict-key-*
+        for node in 1 2 3; do
+            timing_log "Generating node $node with prefix 'n${node}_'..."
+            python3 "$(dirname "$0")/gen-large-smd.py" \
+                --items "$items_per_node" \
+                --module "$TIMING_MODULE" \
+                --value-size "$TIMING_VALUE_SIZE" \
+                --key-prefix "n${node}_" \
+                --out "${SMD_DATA_DIR}/node${node}/smd/${TIMING_MODULE}.smd"
+        done
+    else
+        # All nodes have same keys but different generations/timestamps
+        # Node 1: gen=1, ts=BASE
+        # Node 2: gen=2, ts=BASE+1000000 (newer)
+        # Node 3: gen=3, ts=BASE+2000000 (newest - should win)
+        for node in 1 2 3; do
+            timing_log "Generating node $node with gen=$node..."
+            python3 "$(dirname "$0")/gen-large-smd.py" \
+                --items "$items_per_node" \
+                --module "$TIMING_MODULE" \
+                --value-size "$TIMING_VALUE_SIZE" \
+                --generation "$node" \
+                --ts-offset "$((node * 1000000))" \
+                --out "${SMD_DATA_DIR}/node${node}/smd/${TIMING_MODULE}.smd"
+        done
+    fi
+
+    # Show what was generated
+    timing_log "SMD files per node:"
+    for node in 1 2 3; do
+        local f="${SMD_DATA_DIR}/node${node}/smd/${TIMING_MODULE}.smd"
+        if [ -f "$f" ]; then
+            local size
+            size=$(du -sh "$f" 2>/dev/null | cut -f1)
+            timing_log "  Node $node: $size"
+        fi
+    done
+}
+
+# Run conflict timing test
+timing_conflict_run() {
+    local mode="$1"
+    local items_per_node="$2"
+    local results_file="$3"
+
+    timing_teardown
+
+    timing_conflict_seed_smd "$mode" "$items_per_node"
+
+    # Calculate totals
+    local total_items=$((items_per_node * 3))
+    local smd_mb
+    smd_mb=$(python3 -c "
+import os
+total = 0
+for n in [1,2,3]:
+    f = '${SMD_DATA_DIR}/node' + str(n) + '/smd/${TIMING_MODULE}.smd'
+    if os.path.exists(f):
+        total += os.path.getsize(f)
+print(f'{total / 1048576:.2f}')
+")
+
+    if [ "$mode" = "disjoint" ]; then
+        timing_log "Starting 3-node cluster (disjoint: ${items_per_node} unique items/node = ${total_items} total)..."
+    else
+        timing_log "Starting 3-node cluster (conflict: ${items_per_node} items/node, all same keys, different gens)..."
+    fi
+
+    export SMD_DATA_DIR ASD_BINARY
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 600)
+
+    local sync_us
+    sync_us=$(timing_extract_sync_us)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: cluster did not form"
+        timing_teardown
+        return 1
+    fi
+
+    local sync_ms="n/a"
+    if [ "$sync_us" != "-1" ]; then
+        sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+    fi
+
+    # Check for timeout
+    local timed_out=0
+    if docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1 \
+            | grep -q "SMD sync timed out\|initial SMD sync timed out"; then
+        timed_out=1
+        timing_log "WARNING: SMD sync timed out on node 1!"
+    fi
+
+    timing_log "RESULT: mode=$mode  items_per_node=$items_per_node  total=$total_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+
+    echo -e "${mode}\t${items_per_node}\t${total_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
+
+    # Capture phase-timing log lines
+    local phase_log="${results_file%.tsv}-phases.log"
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs 2>&1 \
+        | grep -E "full-to-pr timing|full-from-pr timing" \
+        | sed "s/^/[${mode}:${items_per_node}] /" >> "$phase_log"
+
+    timing_teardown
+}
+
+test_conflict_smd_timing() {
+    # Validate ASD_BINARY
+    if [ -z "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
+        return 1
+    fi
+    if [ ! -f "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
+        return 1
+    fi
+
+    timing_log "=== Conflict SMD Timing Test ==="
+    timing_log "ASD_BINARY: $ASD_BINARY"
+    timing_log "Mode: $TIMING_CONFLICT_MODE (disjoint=unique keys per node, conflict=same keys different gens)"
+    timing_log "Items per node: $TIMING_CONFLICT_ITEMS"
+    timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+    mkdir -p "$TIMING_RESULTS_DIR"
+    local results_file="${TIMING_RESULTS_DIR}/timing-conflict-$(date '+%Y%m%d-%H%M%S').tsv"
+    echo -e "mode\titems_per_node\ttotal_items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tvalue_size_b\tsync_timeout" > "$results_file"
+    timing_log "Results file: $results_file"
+
+    timing_conflict_run "$TIMING_CONFLICT_MODE" "$TIMING_CONFLICT_ITEMS" "$results_file"
+
+    timing_log "=== Conflict timing test COMPLETE ==="
+    timing_log "Results:"
+    column -t "$results_file"
+}
+
+# ---------------------------------------------------------------------------
+# Rejoin Timing Tests (timing-rejoin)
+# ---------------------------------------------------------------------------
+#
+# Simulates a realistic node rejoin scenario with realistic SMD data:
+#   - Nodes 1 & 2: Have current data (all modules at max)
+#   - Node 3: Stale data - has STALE_PCT% of items with older generation,
+#             missing the remaining (1-STALE_PCT)% that were added while it was down
+#
+# This tests the realistic case of a node rejoining after being down for maintenance.
+
+TIMING_REJOIN_STALE_PCT="${TIMING_REJOIN_STALE_PCT:-80}"  # % of items node 3 has (stale)
+TIMING_REJOIN_SECURITY_ITEMS="${TIMING_REJOIN_SECURITY_ITEMS:-100000}"  # security items for current nodes
+
+timing_rejoin_seed_smd() {
+    local stale_pct="$1"
+    local security_items="$2"
+
+    timing_log "Seeding rejoin SMD: stale_pct=${stale_pct}%  security_items=$security_items"
+
+    # Prepare per-node smd and log directories
+    for node in 1 2 3; do
+        rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        rm -rf "${SMD_DATA_DIR}/node${node}/log"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/log"
+    done
+
+    local script_dir="$(dirname "$0")"
+    
+    # Generate "current" data for nodes 1 & 2 (generation=2, newer timestamps)
+    timing_log "Generating current data for nodes 1 & 2..."
+    for module in truncate sindex security masking; do
+        local items_flag=""
+        if [ "$module" = "security" ]; then
+            items_flag="--items $security_items"
+        fi
+        
+        python3 "$script_dir/gen-realistic-smd.py" \
+            --out-dir "${SMD_DATA_DIR}/node1/smd" \
+            --module "$module" \
+            $items_flag
+    done
+    
+    # Copy node 1's data to node 2 (they're in sync)
+    cp -r "${SMD_DATA_DIR}/node1/smd/"* "${SMD_DATA_DIR}/node2/smd/"
+    
+    # Generate "stale" data for node 3:
+    # - Has stale_pct% of the items (older generation)
+    # - Missing the rest (items added while node was down)
+    timing_log "Generating stale data for node 3 (${stale_pct}% of items, older gen)..."
+    
+    python3 << EOF
+import json
+import os
+
+stale_pct = $stale_pct
+node1_smd_dir = "${SMD_DATA_DIR}/node1/smd"
+node3_smd_dir = "${SMD_DATA_DIR}/node3/smd"
+
+for smd_file in os.listdir(node1_smd_dir):
+    if not smd_file.endswith('.smd'):
+        continue
+    
+    with open(os.path.join(node1_smd_dir, smd_file)) as f:
+        items = json.load(f)
+    
+    # items[0] is the header [cv_key, cv_tid]
+    header = items[0]
+    data_items = items[1:]
+    
+    # Take first stale_pct% of items, make them stale (older gen, older ts)
+    n_stale = int(len(data_items) * stale_pct / 100)
+    stale_items = []
+    for item in data_items[:n_stale]:
+        stale_item = item.copy()
+        stale_item['generation'] = max(1, item['generation'] - 1)  # older gen
+        stale_item['timestamp'] = item['timestamp'] - 1000000  # older ts
+        stale_items.append(stale_item)
+    
+    # Write node 3's stale SMD file
+    node3_data = [header] + stale_items
+    out_path = os.path.join(node3_smd_dir, smd_file)
+    with open(out_path, 'w') as f:
+        json.dump(node3_data, f, separators=(',', ':'))
+    
+    # Debug: show first key from each to verify they match
+    if data_items:
+        print(f"  {smd_file}: {len(data_items)} current -> {len(stale_items)} stale")
+        print(f"    Node1 key[0]: {data_items[0]['key'][:60]}...")
+        if stale_items:
+            print(f"    Node3 key[0]: {stale_items[0]['key'][:60]}...")
+EOF
+
+    # Show what was generated
+    timing_log "SMD files per node:"
+    for node in 1 2 3; do
+        timing_log "  Node $node:"
+        for f in "${SMD_DATA_DIR}/node${node}/smd"/*.smd; do
+            if [ -f "$f" ]; then
+                local name=$(basename "$f")
+                local size=$(du -sh "$f" 2>/dev/null | cut -f1)
+                local count=$(python3 -c "import json; print(len(json.load(open('$f')))-1)" 2>/dev/null || echo "?")
+                timing_log "    $name: $count items, $size"
+            fi
+        done
+    done
+}
+
+timing_rejoin_run() {
+    local stale_pct="$1"
+    local security_items="$2"
+    local results_file="$3"
+
+    timing_teardown
+
+    timing_rejoin_seed_smd "$stale_pct" "$security_items"
+
+    # Calculate totals
+    local current_items=$(python3 -c "
+import json, os
+total = 0
+for f in os.listdir('${SMD_DATA_DIR}/node1/smd'):
+    if f.endswith('.smd'):
+        total += len(json.load(open('${SMD_DATA_DIR}/node1/smd/' + f))) - 1
+print(total)
+")
+    local stale_items=$(python3 -c "
+import json, os
+total = 0
+for f in os.listdir('${SMD_DATA_DIR}/node3/smd'):
+    if f.endswith('.smd'):
+        total += len(json.load(open('${SMD_DATA_DIR}/node3/smd/' + f))) - 1
+print(total)
+")
+    local smd_mb=$(python3 -c "
+import os
+total = 0
+for n in [1,2,3]:
+    d = '${SMD_DATA_DIR}/node' + str(n) + '/smd'
+    for f in os.listdir(d):
+        total += os.path.getsize(os.path.join(d, f))
+print(f'{total / 1048576:.2f}')
+")
+
+    # Estimate per-module wire sizes (key + value + 4B gen + 8B ts + msgpack overhead)
+    timing_log "Per-module wire size estimates (128MB limit per module):"
+    python3 << EOF
+import json, os
+smd_dir = '${SMD_DATA_DIR}/node1/smd'
+for f in sorted(os.listdir(smd_dir)):
+    if not f.endswith('.smd'):
+        continue
+    path = os.path.join(smd_dir, f)
+    try:
+        data = json.load(open(path))
+        items = data[1:]  # skip header
+        n = len(items)
+        if n == 0:
+            continue
+        # Calculate actual key+value sizes
+        total_key = sum(len(item['key']) for item in items)
+        total_val = sum(len(item.get('value', '') or '') for item in items)
+        # Wire = keys + values + gen(4B) + ts(8B) + msgpack overhead (~4B per item)
+        wire = total_key + total_val + n * (4 + 8 + 4)
+        pct = wire * 100 / (128 * 1024 * 1024)
+        print(f"  {f}: {n} items, {wire/1024/1024:.1f}MB wire ({pct:.0f}% of limit)")
+    except Exception as e:
+        print(f"  {f}: error - {e}")
+EOF
+
+    timing_log "Starting 3-node cluster (rejoin scenario)..."
+    timing_log "  Nodes 1,2: $current_items items (current)"
+    timing_log "  Node 3:    $stale_items items (stale, ${stale_pct}% of current)"
+    timing_log "  Missing on node 3: $((current_items - stale_items)) items"
+
+    export SMD_DATA_DIR ASD_BINARY
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 600)
+
+    local sync_us
+    sync_us=$(timing_extract_sync_us)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: cluster did not form"
+        timing_teardown
+        return 1
+    fi
+
+    local sync_ms="n/a"
+    if [ "$sync_us" != "-1" ]; then
+        sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+    fi
+
+    # Check for timeout
+    local timed_out=0
+    if docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1 \
+            | grep -q "SMD sync timed out\|initial SMD sync timed out"; then
+        timed_out=1
+        timing_log "WARNING: SMD sync timed out on node 1!"
+    fi
+
+    timing_log "RESULT: stale_pct=$stale_pct  current=$current_items  stale=$stale_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+    timing_log "Server logs: ${SMD_DATA_DIR}/node{1,2,3}/log/aerospike.log"
+
+    echo -e "${stale_pct}\t${current_items}\t${stale_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${timed_out}" >> "$results_file"
+
+    # Capture and display phase-timing log lines
+    timing_log "Phase timing from principal (node 1):"
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1 \
+        | grep -E "full-to-pr timing|full-from-pr timing" \
+        | while read line; do timing_log "  $line"; done
+
+    local phase_log="${results_file%.tsv}-phases.log"
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs 2>&1 \
+        | grep -E "full-to-pr timing|full-from-pr timing" \
+        | sed "s/^/[rejoin:${stale_pct}%] /" >> "$phase_log"
+
+    timing_teardown
+}
+
+test_rejoin_smd_timing() {
+    # Validate ASD_BINARY
+    if [ -z "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
+        return 1
+    fi
+    if [ ! -f "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
+        return 1
+    fi
+
+    timing_log "=== Rejoin SMD Timing Test ==="
+    timing_log "ASD_BINARY: $ASD_BINARY"
+    timing_log "Stale percentage: $TIMING_REJOIN_STALE_PCT%"
+    timing_log "Security items: $TIMING_REJOIN_SECURITY_ITEMS"
+    timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+    mkdir -p "$TIMING_RESULTS_DIR"
+    local results_file="${TIMING_RESULTS_DIR}/timing-rejoin-$(date '+%Y%m%d-%H%M%S').tsv"
+    echo -e "stale_pct\tcurrent_items\tstale_items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tsync_timeout" > "$results_file"
+    timing_log "Results file: $results_file"
+
+    timing_rejoin_run "$TIMING_REJOIN_STALE_PCT" "$TIMING_REJOIN_SECURITY_ITEMS" "$results_file"
+
+    timing_log "=== Rejoin timing test COMPLETE ==="
+    timing_log "Results:"
+    column -t "$results_file"
+}
+
 test_realistic_smd_timing() {
     # Validate ASD_BINARY is set and is a file
     if [ -z "$ASD_BINARY" ]; then
@@ -847,6 +1275,12 @@ case "${1:-all}" in
     timing-real)
         test_realistic_smd_timing
         ;;
+    timing-conflict)
+        test_conflict_smd_timing
+        ;;
+    timing-rejoin)
+        test_rejoin_smd_timing
+        ;;
     show-limits)
         python3 "$(dirname "$0")/gen-realistic-smd.py" --show-limits
         ;;
@@ -860,7 +1294,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|timing-real|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -890,6 +1324,25 @@ case "${1:-all}" in
         echo "                  TIMING_REAL_SECURITY_ITEMS=300000  (extreme LDAP scenario)"
         echo "                  TIMING_RESULTS_DIR=./timing-results"
         echo "                  SMD_DATA_DIR=/tmp/smd-timing-data"
+        echo ""
+        echo "  timing-conflict - Test worst-case merge: all nodes have different SMD data"
+        echo "                    Two modes (set TIMING_CONFLICT_MODE):"
+        echo "                      disjoint - Each node has unique keys (tests hash insertion)"
+        echo "                      conflict - Same keys, different generations (tests conflict resolution)"
+        echo "                    Tune with env vars:"
+        echo "                      TIMING_CONFLICT_MODE=disjoint   (or 'conflict')"
+        echo "                      TIMING_CONFLICT_ITEMS=50000     (items per node)"
+        echo "                      TIMING_VALUE_SIZE=200           (bytes per value)"
+        echo ""
+        echo "  timing-rejoin - Realistic node rejoin with stale + missing data"
+        echo "                  Uses gen-realistic-smd.py for all modules"
+        echo "                  Simulates: node 3 was down, has stale data + missed updates"
+        echo "                    - Nodes 1,2: current data (all modules at realistic max)"
+        echo "                    - Node 3: STALE_PCT% of items with older generation"
+        echo "                    - Node 3 is missing (100-STALE_PCT)% of items"
+        echo "                  Tune with env vars:"
+        echo "                    TIMING_REJOIN_STALE_PCT=80       (% of items node 3 has)"
+        echo "                    TIMING_REJOIN_SECURITY_ITEMS=100000  (security module size)"
         echo ""
         echo "  show-limits - Show valid entry size ranges per SMD module"
         echo ""

@@ -29,10 +29,11 @@ services:
         aliases:
           - smd-sync-test-aerospike-1
     volumes:
-      - ./conf/aerospike-node1.conf:/etc/aerospike/aerospike.conf
-      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ./conf-security/aerospike-node1.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/smd:/opt/aerospike/smd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/log:/var/log/aerospike
     privileged: true
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
@@ -52,10 +53,11 @@ services:
         aliases:
           - smd-sync-test-aerospike-2
     volumes:
-      - ./conf/aerospike-node2.conf:/etc/aerospike/aerospike.conf
-      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ./conf-security/aerospike-node2.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/smd:/opt/aerospike/smd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/log:/var/log/aerospike
     privileged: true
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
@@ -75,10 +77,11 @@ services:
         aliases:
           - smd-sync-test-aerospike-3
     volumes:
-      - ./conf/aerospike-node3.conf:/etc/aerospike/aerospike.conf
-      - ./conf/features.conf:/etc/aerospike/features.conf
+      - ./conf-security/aerospike-node3.conf:/etc/aerospike/aerospike.conf
+      - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/smd:/opt/aerospike/smd
+      - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/log:/var/log/aerospike
     privileged: true
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:

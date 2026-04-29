@@ -9,6 +9,8 @@
 log.out
 **/data/
 **/smd/
+bobRuns/
+**results**
 
 # Python
 __pycache__/

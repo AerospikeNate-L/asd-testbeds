@@ -139,15 +139,36 @@ Measures SMD full-sync time as a function of payload size. Uses pre-seeded `.smd
 JSON files injected directly into the principal's work directory before node start,
 bypassing `asinfo` entirely to reach MB–100 MB scale quickly.
 
+### Prerequisites
+
+```bash
+# Build the server with Enterprise Edition
+cd /path/to/aerospike-server
+make +ee -j$(nproc)
+
+# Set the binary path
+export ASD_BINARY=$(pwd)/target/Linux-x86_64/bin/asd
+
+# Verify Docker is running
+docker info >/dev/null 2>&1 || echo "Docker not running"
+```
+
 ### Quick Start
 
 ```bash
+cd local/docker/smd-sync-test
+
 # Default sweep: 10K, 50K, 100K items at 200B/value (~3–38 MB)
-export ASD_BINARY=/path/to/asd
 ./test-smd-sync.sh timing
 
 # Custom sweep: larger items
 TIMING_ITEMS="10000 50000 100000" TIMING_VALUE_SIZE=1024 ./test-smd-sync.sh timing
+
+# Realistic worst-case data (truncate, sindex, security, masking)
+./test-smd-sync.sh timing-real
+
+# Node rejoin with stale data (tests merge performance)
+TIMING_REJOIN_SECURITY_ITEMS=450000 TIMING_REJOIN_STALE_PCT=95 ./test-smd-sync.sh timing-rejoin
 
 # Results are written to ./timing-results/timing-YYYYMMDD-HHMMSS.tsv
 ```
@@ -159,6 +180,15 @@ TIMING_ITEMS="10000 50000 100000" TIMING_VALUE_SIZE=1024 ./test-smd-sync.sh timi
 | `wall_cluster_ms` | Wall-clock ms from container start until `cluster_size=3` |
 | `sync_elapsed_us` | Microseconds from SMD sync log: `initial SMD sync wait done - elapsed NNN us` (service-start path) or `sync wait done cl_key … elapsed NNN us` (partition-balance path) |
 
+### Timing Test Modes
+
+| Mode | Description |
+|------|-------------|
+| `timing` | Basic sweep: N items at configurable value size |
+| `timing-real` | Realistic worst-case: all modules (truncate, sindex, security, masking) at max sizes |
+| `timing-conflict` | Tests conflict resolution during merge |
+| `timing-rejoin` | Node rejoin with stale data - tests merge performance when principal has outdated items |
+
 ### Configuration
 
 | Env Var | Default | Description |
@@ -167,6 +197,8 @@ TIMING_ITEMS="10000 50000 100000" TIMING_VALUE_SIZE=1024 ./test-smd-sync.sh timi
 | `TIMING_VALUE_SIZE` | `200` | Bytes per SMD value string |
 | `SMD_DATA_DIR` | `/tmp/smd-timing-data` | Host directory for per-node smd bind mounts |
 | `TIMING_RESULTS_DIR` | `./timing-results` | Where TSV results are written |
+| `TIMING_REJOIN_SECURITY_ITEMS` | `100000` | Security items for timing-rejoin mode |
+| `TIMING_REJOIN_STALE_PCT` | `95` | Percentage of items that are stale on rejoining node |
 
 ### File Layout
 
@@ -183,6 +215,19 @@ timing-results/           -- TSV output from timing runs
 3. When the cluster forms, node 1 (principal, lowest node-id `a1`) must
    full-sync its entire DB to nodes 2 and 3 via `module_fill_msg` → fabric msgpack.
 4. The test captures the elapsed time from the server's own sync-completion log.
+
+### timing-rejoin Mode
+
+Simulates a realistic node rejoin scenario where the rejoining node has **stale data**
+that must be merged with current data from the cluster:
+
+1. Nodes 1 & 2 have "current" data (all modules at configured sizes)
+2. Node 3 has "stale" data: `STALE_PCT`% of items with older timestamps/generations
+3. Node 3 is missing the remaining `(100-STALE_PCT)`% of items (added while it was down)
+4. When the cluster forms, node 3 (highest node-id, becomes principal) must merge
+   incoming data from nodes 1 & 2 against its existing stale database
+
+This tests the `smd_hash` merge performance and conflict resolution at scale.
 
 ## Limitations
 
