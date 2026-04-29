@@ -413,6 +413,15 @@ TIMING_MODULE="evict"          # evict module: no key format validation, clean l
 TIMING_VALUE_SIZE="${TIMING_VALUE_SIZE:-200}"  # bytes per value (default ~200B)
 TIMING_ITEMS="${TIMING_ITEMS:-10000 50000 100000 200000 300000 400000}"  # item counts to sweep
 
+# Realistic timing mode configuration
+# Uses gen-realistic-smd.py to generate worst-case but valid SMD data
+TIMING_REAL_MODULES="${TIMING_REAL_MODULES:-truncate sindex security masking}"
+TIMING_REAL_MAX_SIZE="${TIMING_REAL_MAX_SIZE:-false}"  # Use max-length keys/values
+
+# Per-module item counts (override defaults from gen-realistic-smd.py)
+# Set these to simulate different deployment scales
+TIMING_REAL_SECURITY_ITEMS="${TIMING_REAL_SECURITY_ITEMS:-}"  # e.g., 300000 for extreme LDAP
+
 # Ensure results dir exists
 TIMING_RESULTS_DIR="${TIMING_RESULTS_DIR:-./timing-results}"
 
@@ -569,7 +578,20 @@ timing_run_one() {
 }
 
 test_large_smd_timing() {
+    # Validate ASD_BINARY is set and is a file
+    if [ -z "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
+        timing_log "  Example: export ASD_BINARY=/path/to/aerospike-server/target/Linux-x86_64/bin/asd"
+        return 1
+    fi
+    if [ ! -f "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
+        timing_log "  Make sure the path points to the asd binary, not a directory."
+        return 1
+    fi
+
     timing_log "=== SMD Large-Payload Timing Sweep ==="
+    timing_log "ASD_BINARY: $ASD_BINARY"
     timing_log "Sweep: items=${TIMING_ITEMS}  value_size=${TIMING_VALUE_SIZE}B"
     timing_log "Results dir: $TIMING_RESULTS_DIR"
 
@@ -591,6 +613,184 @@ test_large_smd_timing() {
         timing_log "=== Timing sweep had FAILURES ==="
         return 1
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Realistic SMD Timing Tests (timing-real)
+# ---------------------------------------------------------------------------
+#
+# Uses gen-realistic-smd.py to generate worst-case but valid SMD data:
+#   - truncate: max out at 131,104 items (32 ns × 4096 sets + 32)
+#   - sindex:   max out at 8,192 items (32 ns × 256 sindexes)
+#   - security: LDAP-heavy scenario with ~100K users
+#   - masking:  heavy masking deployment with ~50K rules
+#
+# All entries use valid key/value formats that the server will accept.
+
+# Seed node 1 with realistic SMD data; clear nodes 2 & 3.
+timing_real_seed_smd() {
+    local modules="$1"
+    local max_size="$2"
+
+    timing_log "Seeding realistic SMD: modules=[$modules]  max_size=$max_size"
+
+    # Prepare per-node smd directories
+    for node in 1 2 3; do
+        rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+        mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+    done
+
+    # Generate .smd files for node 1
+    local max_size_flag=""
+    if [ "$max_size" = "true" ]; then
+        max_size_flag="--max-size"
+    fi
+
+    for module in $modules; do
+        # Check for per-module item count override
+        local items_flag=""
+        case "$module" in
+            security)
+                [ -n "$TIMING_REAL_SECURITY_ITEMS" ] && items_flag="--items $TIMING_REAL_SECURITY_ITEMS"
+                ;;
+        esac
+        
+        timing_log "Generating $module... ${items_flag:-"(default)"}"
+        python3 "$(dirname "$0")/gen-realistic-smd.py" \
+            --out-dir "${SMD_DATA_DIR}/node1/smd" \
+            --module "$module" \
+            $max_size_flag \
+            $items_flag
+    done
+
+    # Show what was generated
+    timing_log "Node 1 SMD files:"
+    for f in "${SMD_DATA_DIR}/node1/smd"/*.smd; do
+        if [ -f "$f" ]; then
+            local size
+            size=$(du -sh "$f" 2>/dev/null | cut -f1)
+            timing_log "  $(basename "$f"): $size"
+        fi
+    done
+}
+
+# Run realistic timing test
+timing_real_run() {
+    local modules="$1"
+    local results_file="$2"
+
+    timing_teardown
+
+    timing_real_seed_smd "$modules" "$TIMING_REAL_MAX_SIZE"
+
+    # Calculate total items and size
+    local total_items=0
+    local total_mb=0
+    for f in "${SMD_DATA_DIR}/node1/smd"/*.smd; do
+        if [ -f "$f" ]; then
+            # Count items (subtract 1 for header)
+            local items
+            items=$(python3 -c "import json; print(len(json.load(open('$f')))-1)")
+            total_items=$((total_items + items))
+            # Get size
+            local mb
+            mb=$(python3 -c "import os; print(f'{os.path.getsize(\"$f\") / 1048576:.2f}')")
+            total_mb=$(python3 -c "print(f'{float(\"$total_mb\") + float(\"$mb\"):.2f}')")
+        fi
+    done
+
+    timing_log "Starting 3-node cluster (total: $total_items items, ${total_mb} MB)..."
+
+    export SMD_DATA_DIR ASD_BINARY
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 600)  # longer timeout for realistic data
+
+    local sync_us
+    sync_us=$(timing_extract_sync_us)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: cluster did not form"
+        timing_teardown
+        return 1
+    fi
+
+    local sync_ms="n/a"
+    if [ "$sync_us" != "-1" ]; then
+        sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+    fi
+
+    # Check for timeout
+    local timed_out=0
+    if docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1 \
+            | grep -q "SMD sync timed out\|initial SMD sync timed out"; then
+        timed_out=1
+        timing_log "WARNING: SMD sync timed out on node 1!"
+    fi
+
+    timing_log "RESULT: items=$total_items  smd=${total_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+
+    # Append result
+    echo -e "${modules// /+}\t${total_items}\t${total_mb}\t${wall_ms}\t${sync_us}\t${TIMING_REAL_MAX_SIZE}\t${timed_out}" >> "$results_file"
+
+    # Capture per-module stats (only for modules we generated, not server-created files)
+    timing_log "Per-module breakdown:"
+    for module in $modules; do
+        local f="${SMD_DATA_DIR}/node1/smd/${module}.smd"
+        if [ -f "$f" ] && [ -r "$f" ]; then
+            local mod_name="$module"
+            local items
+            items=$(python3 -c "import json; print(len(json.load(open('$f')))-1)" 2>/dev/null || echo "?")
+            local mb
+            mb=$(python3 -c "import os; print(f'{os.path.getsize(\"$f\") / 1048576:.2f}')" 2>/dev/null || echo "?")
+            timing_log "  $mod_name: $items items, ${mb} MB"
+        fi
+    done
+
+    # Capture phase-timing log lines
+    local phase_log="${results_file%.tsv}-phases.log"
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs 2>&1 \
+        | grep -E "full-to-pr timing|full-from-pr timing" \
+        | sed "s/^/[realistic] /" >> "$phase_log"
+
+    timing_teardown
+}
+
+test_realistic_smd_timing() {
+    # Validate ASD_BINARY is set and is a file
+    if [ -z "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
+        timing_log "  Example: export ASD_BINARY=/path/to/aerospike-server/target/Linux-x86_64/bin/asd"
+        return 1
+    fi
+    if [ ! -f "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
+        timing_log "  Make sure the path points to the asd binary, not a directory."
+        return 1
+    fi
+
+    timing_log "=== Realistic SMD Timing Test ==="
+    timing_log "ASD_BINARY: $ASD_BINARY"
+    timing_log "Modules: $TIMING_REAL_MODULES"
+    timing_log "Max-size entries: $TIMING_REAL_MAX_SIZE"
+    timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+    # Show limits first
+    timing_log "Module limits (from gen-realistic-smd.py --show-limits):"
+    python3 "$(dirname "$0")/gen-realistic-smd.py" --show-limits 2>&1 | head -50
+
+    mkdir -p "$TIMING_RESULTS_DIR"
+    local results_file="${TIMING_RESULTS_DIR}/timing-real-$(date '+%Y%m%d-%H%M%S').tsv"
+    echo -e "modules\titems\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tmax_size\tsync_timeout" > "$results_file"
+    timing_log "Results file: $results_file"
+
+    # Run the test
+    timing_real_run "$TIMING_REAL_MODULES" "$results_file"
+
+    timing_log "=== Realistic timing test COMPLETE ==="
+    timing_log "Results:"
+    column -t "$results_file"
 }
 
 cleanup() {
@@ -644,6 +844,12 @@ case "${1:-all}" in
     timing)
         test_large_smd_timing
         ;;
+    timing-real)
+        test_realistic_smd_timing
+        ;;
+    show-limits)
+        python3 "$(dirname "$0")/gen-realistic-smd.py" --show-limits
+        ;;
     cleanup)
         cleanup
         ;;
@@ -654,7 +860,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|timing-real|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -665,12 +871,27 @@ case "${1:-all}" in
         echo "  all         - Run all correctness tests"
         echo ""
         echo "Timing tests:"
-        echo "  timing      - Sweep large SMD payloads and measure sync time"
+        echo "  timing      - Sweep large SMD payloads (synthetic, unrealistic keys)"
         echo "                Tune with env vars:"
         echo "                  TIMING_ITEMS='10000 50000 100000'  (item counts)"
         echo "                  TIMING_VALUE_SIZE=200               (bytes per value)"
         echo "                  TIMING_RESULTS_DIR=./timing-results (output dir)"
         echo "                  SMD_DATA_DIR=/tmp/smd-timing-data   (host smd dirs)"
+        echo ""
+        echo "  timing-real - Test realistic worst-case SMD data with valid entries"
+        echo "                Uses gen-realistic-smd.py to generate:"
+        echo "                  - truncate: 131,104 items (32 ns × 4096 sets + 32)"
+        echo "                  - sindex:   8,192 items (32 ns × 256 sindexes)"
+        echo "                  - security: 100,000 items (default) or TIMING_REAL_SECURITY_ITEMS"
+        echo "                  - masking:  50,000 items (heavy masking rules)"
+        echo "                Tune with env vars:"
+        echo "                  TIMING_REAL_MODULES='truncate sindex security masking'"
+        echo "                  TIMING_REAL_MAX_SIZE=true  (use max-length keys/values)"
+        echo "                  TIMING_REAL_SECURITY_ITEMS=300000  (extreme LDAP scenario)"
+        echo "                  TIMING_RESULTS_DIR=./timing-results"
+        echo "                  SMD_DATA_DIR=/tmp/smd-timing-data"
+        echo ""
+        echo "  show-limits - Show valid entry size ranges per SMD module"
         echo ""
         echo "Cleanup:"
         echo "  cleanup        - Stop correctness test containers (preserve for inspection)"
