@@ -7,6 +7,10 @@ services:
       - ./conf:/etc/aerospike
       - ${ASD_BINARY:-./bin/asd}:/usr/bin/asd
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     deploy:
       replicas: ${REPLICAS:-3}
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]

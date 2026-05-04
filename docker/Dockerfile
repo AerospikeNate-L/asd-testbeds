@@ -1,27 +1,40 @@
 ################################################################################
 # Aerospike Server Development Runtime Image
-# Ubuntu 22.04 with runtime dependencies for EE + tools
+#
+# Base matches a typical EE dev host (Debian 13 / trixie): bind-mounted `asd`
+# must see the same glibc, OpenLDAP symbol versions, and libstdc++ as the build.
+# Aerospike tools: use newest distro-specific bundle available from upstream
+# (debian12 today); `apt-get install -f` pulls compatible runtime libs on trixie.
 ################################################################################
 
-FROM ubuntu:22.04
+FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime dependencies for EE binary
+# Runtime dependencies for EE binary (host-mounted asd)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
-    zlib1g \
-    libldap-2.5-0 \
-    libcurl4 \
-    wget \
     ca-certificates \
+    wget \
+    libssl3t64 \
+    zlib1g \
+    libldap2 \
+    libcurl4t64 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install aerospike-tools
-RUN wget -q https://download.aerospike.com/artifacts/aerospike-tools/9.2.1/aerospike-tools_9.2.1_ubuntu22.04_x86_64.tgz -O /tmp/tools.tgz \
-    && tar -xzf /tmp/tools.tgz -C /tmp \
-    && dpkg -i /tmp/aerospike-tools_9.2.1_ubuntu22.04_x86_64/aerospike-tools_9.2.1-ubuntu22.04_amd64.deb \
-    && rm -rf /tmp/aerospike-tools* /tmp/tools.tgz
+# Aerospike tools (no trixie-specific bundle published for 9.2.1; debian12 is closest).
+ARG AEROSPIKE_TOOLS_VERSION=9.2.1
+ARG AEROSPIKE_TOOLS_DIST=debian12
+ARG AEROSPIKE_TOOLS_ARCH=x86_64
+RUN set -eux; \
+    tools_tgz="aerospike-tools_${AEROSPIKE_TOOLS_VERSION}_${AEROSPIKE_TOOLS_DIST}_${AEROSPIKE_TOOLS_ARCH}.tgz"; \
+    wget -q "https://download.aerospike.com/artifacts/aerospike-tools/${AEROSPIKE_TOOLS_VERSION}/${tools_tgz}" -O /tmp/tools.tgz; \
+    tar -xzf /tmp/tools.tgz -C /tmp; \
+    deb_arch=amd64; \
+    if [ "${AEROSPIKE_TOOLS_ARCH}" = aarch64 ]; then deb_arch=arm64; fi; \
+    dpkg -i "/tmp/aerospike-tools_${AEROSPIKE_TOOLS_VERSION}_${AEROSPIKE_TOOLS_DIST}_${AEROSPIKE_TOOLS_ARCH}/aerospike-tools_${AEROSPIKE_TOOLS_VERSION}-${AEROSPIKE_TOOLS_DIST}_${deb_arch}.deb" || true; \
+    apt-get update; \
+    apt-get install -y -f --no-install-recommends; \
+    rm -rf /var/lib/apt/lists/* /tmp/aerospike-tools* /tmp/tools.tgz
 
 # Debugging tools (optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \

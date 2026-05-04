@@ -114,6 +114,7 @@ Tests that a new node joining an existing cluster receives SMD.
 | `conf/aerospike-node[1-3].conf` | Node configs without security (for sindex tests) |
 | `conf-security/aerospike-node[1-3].conf` | Node configs with security enabled (for auth test) |
 | `conf/features.conf` | Enterprise license file |
+| `conf-security/features.conf` | Enterprise license file (auth / timing compose) |
 | `docker-compose.yaml` | Default compose (no security) |
 | `docker-compose-security.yaml` | Security-enabled compose (for auth test) |
 

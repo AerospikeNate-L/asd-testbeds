@@ -35,6 +35,10 @@ services:
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/log:/var/log/aerospike
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
@@ -59,6 +63,10 @@ services:
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/log:/var/log/aerospike
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
@@ -83,6 +91,10 @@ services:
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/log:/var/log/aerospike
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
