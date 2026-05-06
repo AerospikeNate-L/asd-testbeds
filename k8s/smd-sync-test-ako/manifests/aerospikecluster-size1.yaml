@@ -1,0 +1,55 @@
+# Same as aerospikecluster.yaml with spec.size: 1 (preexisting SMD test).
+apiVersion: asdb.aerospike.com/v1
+kind: AerospikeCluster
+metadata:
+  name: smdsync
+  namespace: smd-sync-ako
+spec:
+  size: 1
+  image: smd-sync-asd-enterprise:8.1.2.0-dev
+
+  podSpec:
+    multiPodPerHost: true
+
+  storage:
+    filesystemVolumePolicy:
+      cascadeDelete: true
+      initMethod: deleteFiles
+    volumes:
+      - name: workdir
+        source:
+          persistentVolume:
+            storageClass: standard
+            volumeMode: Filesystem
+            size: 3Gi
+        aerospike:
+          path: /opt/aerospike
+      - name: aerospike-config-secret
+        source:
+          secret:
+            secretName: aerospike-secret
+        aerospike:
+          path: /etc/aerospike/secret
+
+  aerospikeConfig:
+    service:
+      feature-key-file: /etc/aerospike/secret/features.conf
+      cgroup-mem-tracking: true
+    logging:
+      - name: console
+        any: info
+        smd: debug
+        exchange: debug
+    network:
+      service:
+        port: 3000
+      fabric:
+        port: 3001
+      heartbeat:
+        port: 3002
+    namespaces:
+      - name: test
+        replication-factor: 2
+        storage-engine:
+          type: memory
+          data-size: 536870912

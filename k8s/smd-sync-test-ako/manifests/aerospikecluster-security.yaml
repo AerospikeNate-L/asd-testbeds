@@ -1,0 +1,65 @@
+# Security-enabled cluster for ./test-smd-sync-k8s.sh auth
+# Requires aerospike-secret and auth-secret (password key) in smd-sync-ako.
+apiVersion: asdb.aerospike.com/v1
+kind: AerospikeCluster
+metadata:
+  name: smdsync
+  namespace: smd-sync-ako
+spec:
+  size: 3
+  image: smd-sync-asd-enterprise:8.1.2.0-dev
+
+  podSpec:
+    multiPodPerHost: true
+
+  storage:
+    filesystemVolumePolicy:
+      cascadeDelete: true
+      initMethod: deleteFiles
+    volumes:
+      - name: workdir
+        source:
+          persistentVolume:
+            storageClass: standard
+            volumeMode: Filesystem
+            size: 3Gi
+        aerospike:
+          path: /opt/aerospike
+      - name: aerospike-config-secret
+        source:
+          secret:
+            secretName: aerospike-secret
+        aerospike:
+          path: /etc/aerospike/secret
+
+  aerospikeAccessControl:
+    users:
+      - name: admin
+        secretName: auth-secret
+        roles:
+          - sys-admin
+          - user-admin
+
+  aerospikeConfig:
+    service:
+      feature-key-file: /etc/aerospike/secret/features.conf
+      cgroup-mem-tracking: true
+    logging:
+      - name: console
+        any: info
+        smd: debug
+        exchange: debug
+    security: {}
+    network:
+      service:
+        port: 3000
+      fabric:
+        port: 3001
+      heartbeat:
+        port: 3002
+    namespaces:
+      - name: test
+        replication-factor: 2
+        storage-engine:
+          type: memory
+          data-size: 536870912

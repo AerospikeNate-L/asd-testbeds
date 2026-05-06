@@ -1,0 +1,104 @@
+# Pods for AerospikeCluster use serviceAccountName aerospike-operator-controller-manager (AKO internal/controller/cluster/statefulset.go).
+# That SA is created in the operator namespace only; the same name must exist in each workload namespace, with equivalent API access.
+# Placeholder __TESTBED_NAMESPACE__ is replaced by scripts (create-secrets.sh, test-smd-sync-k8s.sh apply_namespace).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aerospike-operator-controller-manager
+  namespace: __TESTBED_NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aerospike-operator-workload-__TESTBED_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  # Default name from AKO config/default (namePrefix aerospike-operator- + manager-role).
+  name: aerospike-operator-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: aerospike-operator-controller-manager
+    namespace: __TESTBED_NAMESPACE__
+---
+# Mirrors AKO config/rbac/leader_election_*.yaml — not covered by aerospike-operator-manager-role ClusterRole.
+# aerospike-init uses leases/configmaps in the pod namespace; without this Role, init exits (often HTTP 403).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aerospike-operator-leader-election-role
+  namespace: __TESTBED_NAMESPACE__
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aerospike-operator-leader-election-rolebinding
+  namespace: __TESTBED_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aerospike-operator-leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: aerospike-operator-controller-manager
+    namespace: __TESTBED_NAMESPACE__
+---
+# aerospike-init lists Nodes (network topology); not in aerospike-operator-manager-role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aerospike-operator-workload-nodes-__TESTBED_NAMESPACE__
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aerospike-operator-workload-nodes-__TESTBED_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aerospike-operator-workload-nodes-__TESTBED_NAMESPACE__
+subjects:
+  - kind: ServiceAccount
+    name: aerospike-operator-controller-manager
+    namespace: __TESTBED_NAMESPACE__
