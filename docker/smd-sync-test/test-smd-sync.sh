@@ -499,31 +499,35 @@ timing_wait_cluster() {
 }
 
 # Extract SMD sync elapsed time from node 1 logs.
-# Checks two log lines (both emitted under "context smd debug"):
-#
-#   as_smd_wait_ready (INFO, fresh node/service start):
-#     "initial SMD sync wait done - elapsed NNN us"
-#
-#   as_smd_cluster_changed_sync (DEBUG, partition balance path):
-#     "sync wait done cl_key XXXX elapsed NNN us"
+# Matches smd.c:
+#   as_smd_wait_ready (INFO): "initial SMD sync done - elapsed NNN us"
+#   as_smd_cluster_changed_sync (DEBUG): "sync wait done cl_key XXXX elapsed NNN us"
 #
 # Returns the largest elapsed microsecond value found (the binding sync wait),
 # or -1 if neither is present.
 timing_extract_sync_us() {
-    local logs
+    local logs primary fallback
     logs=$(docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-1 2>&1)
 
-    # Match both formats; pick the last (largest elapsed) value seen.
-    local sync_us
-    sync_us=$(echo "$logs" \
-        | grep -oP '(?:initial SMD sync wait done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
+    primary=$(echo "$logs" \
+        | grep -oP '(?:initial SMD sync(?: wait)? done - elapsed |sync wait done cl_key [0-9a-fA-F]+ elapsed )\K\d+(?= us)' \
         | sort -n | tail -1)
 
-    if [ -n "$sync_us" ]; then
-        echo "$sync_us"
-    else
-        echo "-1"
+    if [ -n "$primary" ]; then
+        echo "$primary"
+        return 0
     fi
+
+    fallback=$(echo "$logs" \
+        | grep -oP 'full-from-pr timing:[^\n]*total=\K\d+(?= us)' \
+        | awk '{s+=$1} END {print int(s)}')
+    if [ -n "$fallback" ] && [ "$fallback" != "0" ]; then
+        timing_log "sync_elapsed_us fallback: Σ(full-from-pr total) on node1=${fallback} us (no initial/sync-wait line in docker logs)"
+        echo "$fallback"
+        return 0
+    fi
+
+    echo "-1"
 }
 
 # Run a single timing measurement for a given item count.

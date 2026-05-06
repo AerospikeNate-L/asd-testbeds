@@ -36,6 +36,14 @@ TIMING_AC_MANIFEST="${TIMING_AC_MANIFEST:-$MANIFEST_DIR/aerospikecluster-timing.
 # Seed pods mount RWO PVCs on kind/CSI; first attach can sit Pending for a while — avoid kubectl wait Ready until scheduled.
 TIMING_SEED_POD_TIMEOUT="${TIMING_SEED_POD_TIMEOUT:-300}"
 TIMING_PVC_SETTLE_SEC="${TIMING_PVC_SETTLE_SEC:-5}"
+# 0 or unset = entire aerospike-server log since container start (needed for huge SMD log volume).
+# Set to a positive integer to cap lines (e.g. 500000).
+TIMING_LOG_TAIL="${TIMING_LOG_TAIL:-0}"
+# If true, do not delete AerospikeCluster/PVCs after timing-rejoin / each timing sweep iter (inspect logs / avoid rotation losing early lines).
+TIMING_SKIP_FINAL_CLEANUP="${TIMING_SKIP_FINAL_CLEANUP:-false}"
+# After cluster_size=N, SMD may still merge heavy modules (security, …). Poll probe pod logs for
+# "{module:…} full-from-pr timing". 0 = do not wait (legacy fast scrape; under-counts large SMD).
+TIMING_SMD_PHASE_WAIT_SEC="${TIMING_SMD_PHASE_WAIT_SEC:-0}"
 
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-smd-sync-ako}"
 
@@ -163,12 +171,40 @@ collect_server_logs() {
   echo "$out"
 }
 
+# Same as collect_server_logs but honors TIMING_LOG_TAIL (0 = full log; avoids missing SMD lines).
+timing_kubectl_logs_probe_pod() {
+  local pod=$1
+  if [[ -z "${TIMING_LOG_TAIL}" || "${TIMING_LOG_TAIL}" == "0" ]]; then
+    kubectl logs -n "$NS" "$pod" -c aerospike-server 2>/dev/null || true
+  else
+    kubectl logs -n "$NS" "$pod" -c aerospike-server --tail="${TIMING_LOG_TAIL}" 2>/dev/null || true
+  fi
+}
+
+timing_collect_server_logs() {
+  local out="" p
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    out+=$(timing_kubectl_logs_probe_pod "$p")
+    out+=$'\n'
+  done < <(list_pods_sorted)
+  echo "$out"
+}
+
 apply_namespace() {
   kubectl apply -f "$MANIFEST_DIR/namespace.yaml"
   sed "s/__TESTBED_NAMESPACE__/${NS}/g" "$MANIFEST_DIR/workload-operator-rbac.yaml" | kubectl apply -f -
 }
 
 # Seed pods hold RWO mounts; CR deletion alone may leave PVCs terminating for a long time.
+timing_maybe_cleanup() {
+  if [[ "${TIMING_SKIP_FINAL_CLEANUP}" == "true" ]]; then
+    timing_log "TIMING_SKIP_FINAL_CLEANUP=true — leaving cluster/PVCs in $NS (inspect: kubectl logs -n $NS -l app=aerospike-cluster -c aerospike-server)"
+    return 0
+  fi
+  cleanup_full
+}
+
 wait_workdir_pvcs_absent() {
   local wait_n=0 i name
   while [[ $wait_n -lt 360 ]]; do
@@ -637,20 +673,72 @@ timing_wait_cluster_ms() {
   return 0
 }
 
+# Per-pod sum of smd.c "full-from-pr timing: ... total=NNN us" (INFO). Used when
+# kubelet/log volume drops early "initial SMD sync done" lines but phase timings remain.
+# Full-from-pr INFO lines appear as each NPR module finishes merging; cluster_size=3 can precede security.
+timing_wait_module_full_from_pr_logged_k8s() {
+  local module=$1
+  local max_sec=${TIMING_SMD_PHASE_WAIT_SEC:-0}
+  [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=0
+  [[ "$max_sec" == "0" ]] && return 0
+
+  local elapsed=0 probe
+  probe=$(pod_at_index 0)
+
+  timing_log "Waiting up to ${max_sec}s for {${module}:…} full-from-pr timing on $probe (merges can trail cluster_size=3)..."
+
+  while [[ $elapsed -lt $max_sec ]]; do
+    if timing_kubectl_logs_probe_pod "$probe" | grep -qE "\\{${module}:[^}]*\\} full-from-pr timing"; then
+      timing_log "Observed {${module}:} full-from-pr timing after ${elapsed}s"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  timing_log "WARN: no {${module}:} full-from-pr within ${max_sec}s — sync metrics may omit slow modules"
+}
+
+timing_fallback_full_from_pr_max_pod_us_k8s() {
+  local max=0 p log sum
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    log=$(timing_kubectl_logs_probe_pod "$p")
+    sum=$(echo "$log" | grep -oP 'full-from-pr timing:[^\n]*total=\K\d+(?= us)' | awk '{s+=$1} END {print int(s)}')
+    [[ -z "$sum" || "$sum" == "0" ]] && continue
+    if [[ "$sum" -gt "$max" ]]; then max=$sum; fi
+  done < <(list_pods_sorted)
+  echo "$max"
+}
+
+# Prefer accept-thread lines (smd.c); else max over pods of Σ(module full-from-pr total).
 timing_extract_sync_us_k8s() {
-  local probe_pod
-  probe_pod="$(pod_at_index 0)"
-  local logs
-  logs=$(kubectl logs -n "$NS" "$probe_pod" -c aerospike-server --tail=100000 2>&1 || true)
-  local sync_us
-  sync_us=$(echo "$logs" \
-    | grep -oP '(?:initial SMD sync wait done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
+  local logs primary fallback
+  logs=$(timing_collect_server_logs)
+  primary=$(echo "$logs" \
+    | grep -oP '(?:initial SMD sync(?: wait)? done - elapsed |sync wait done cl_key [0-9a-fA-F]+ elapsed )\K\d+(?= us)' \
     | sort -n | tail -1 || true)
-  if [[ -n "$sync_us" ]]; then
-    echo "$sync_us"
-  else
-    echo "-1"
+  if [[ -n "$primary" ]]; then
+    echo "$primary"
+    return 0
   fi
+  fallback=$(timing_fallback_full_from_pr_max_pod_us_k8s)
+  if [[ -n "$fallback" && "$fallback" != "0" ]]; then
+    timing_log "sync_elapsed_us fallback: max-pod Σ(full-from-pr total)=${fallback} us (no initial/sync-wait elapsed line in scrape — often kubelet log rotation / volume)"
+    echo "$fallback"
+    return 0
+  fi
+  echo "-1"
+}
+
+timing_write_sync_breakdown_log() {
+  local results_file=$1
+  local out="${results_file%.tsv}-sync-breakdown.log"
+  timing_log "SMD sync breakdown -> $out"
+  {
+    echo "### $(date -Is) cluster=${CLUSTER} ns=${NS}"
+    timing_collect_server_logs | grep -E 'initial SMD sync|sync wait (start|done)|full-from-pr timing|full-to-pr timing|\{security:'
+  } >> "$out"
 }
 
 timing_prepare_host_rejoin() {
@@ -737,12 +825,17 @@ timing_run_one_k8s() {
   local wall_ms
   wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_CLUSTER_TIMEOUT")
 
+  if [[ "$wall_ms" != "-1" ]]; then
+    timing_wait_module_full_from_pr_logged_k8s "$TIMING_MODULE"
+  fi
+
   local sync_us
   sync_us=$(timing_extract_sync_us_k8s)
+  timing_write_sync_breakdown_log "$results_file"
 
   if [[ "$wall_ms" == "-1" ]]; then
     timing_log "FAIL: cluster did not form for n_items=$n_items"
-    cleanup_full
+    timing_maybe_cleanup
     return 1
   fi
 
@@ -752,7 +845,7 @@ timing_run_one_k8s() {
   fi
 
   local timed_out=0
-  if collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+  if timing_collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
     timed_out=1
     timing_log "WARNING: SMD sync timed out (see pod logs)"
   fi
@@ -760,15 +853,15 @@ timing_run_one_k8s() {
   local smd_mb
   smd_mb=$(python3 -c "import os; print(f'{os.path.getsize(\"${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd\") / 1048576:.2f}')")
 
-  timing_log "RESULT: items=$n_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms}ms (${sync_us}us) timeout=${timed_out}"
+  timing_log "RESULT: items=$n_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out}"
 
   echo -e "${n_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
 
   local phase_log="${results_file%.tsv}-phases.log"
   timing_log "Phase timing -> $phase_log"
-  collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" | sed "s/^/[n=${n_items}] /" >> "$phase_log"
+  timing_collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" | sed "s/^/[n=${n_items}] /" >> "$phase_log"
 
-  cleanup_full
+  timing_maybe_cleanup
 }
 
 test_large_smd_timing_k8s() {
@@ -792,6 +885,7 @@ test_large_smd_timing_k8s() {
   local results_file="${TIMING_RESULTS_DIR}/timing-k8s-$(date '+%Y%m%d-%H%M%S').tsv"
   echo -e "items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tvalue_size_b\tsync_timeout" > "$results_file"
   timing_log "Results file: $results_file"
+  [[ "${TIMING_SKIP_FINAL_CLEANUP}" == "true" ]] && timing_log "TIMING_SKIP_FINAL_CLEANUP=true — last iteration leaves cluster up; run cleanup-full before another sweep"
 
   local failed=0 n
   for n in $TIMING_ITEMS; do
@@ -829,12 +923,17 @@ timing_rejoin_run_k8s() {
   local wall_ms
   wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_REJOIN_CLUSTER_TIMEOUT")
 
+  if [[ "$wall_ms" != "-1" ]]; then
+    timing_wait_module_full_from_pr_logged_k8s "security"
+  fi
+
   local sync_us
   sync_us=$(timing_extract_sync_us_k8s)
+  timing_write_sync_breakdown_log "$results_file"
 
   if [[ "$wall_ms" == "-1" ]]; then
     timing_log "FAIL: cluster did not form (timing-rejoin)"
-    cleanup_full
+    timing_maybe_cleanup
     return 1
   fi
 
@@ -844,7 +943,7 @@ timing_rejoin_run_k8s() {
   fi
 
   local timed_out=0
-  if collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+  if timing_collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
     timed_out=1
     timing_log "WARNING: SMD sync timed out"
   fi
@@ -876,15 +975,15 @@ for n in (1, 2, 3):
 print(f'{total / 1048576:.2f}')
 ")
 
-  timing_log "RESULT: stale_pct=$TIMING_REJOIN_STALE_PCT current=$current_items stale=$stale_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms}ms (${sync_us}us) timeout=${timed_out}"
+  timing_log "RESULT: stale_pct=$TIMING_REJOIN_STALE_PCT current=$current_items stale=$stale_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out}"
 
   echo -e "${TIMING_REJOIN_STALE_PCT}\t${current_items}\t${stale_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${timed_out}" >> "$results_file"
 
   local phase_log="${results_file%.tsv}-phases.log"
-  collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" \
+  timing_collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" \
     | sed "s/^/[rejoin:${TIMING_REJOIN_STALE_PCT}%] /" >> "$phase_log"
 
-  cleanup_full
+  timing_maybe_cleanup
 }
 
 test_rejoin_smd_timing_k8s() {
@@ -900,6 +999,12 @@ test_rejoin_smd_timing_k8s() {
 
   timing_log "=== Rejoin SMD timing (AKO) ==="
   timing_log "Stale %: $TIMING_REJOIN_STALE_PCT  security items: $TIMING_REJOIN_SECURITY_ITEMS"
+  if [[ -z "${TIMING_LOG_TAIL}" || "${TIMING_LOG_TAIL}" == "0" ]]; then
+    timing_log "Log scan: full aerospike-server logs (TIMING_LOG_TAIL=0) for sync/phase lines"
+  else
+    timing_log "Log scan: --tail=${TIMING_LOG_TAIL} (set TIMING_LOG_TAIL=0 for no limit)"
+  fi
+  [[ "${TIMING_SKIP_FINAL_CLEANUP}" == "true" ]] && timing_log "TIMING_SKIP_FINAL_CLEANUP=true — cluster/PVCs kept for kubectl logs / reports"
   timing_log "Results dir: $TIMING_RESULTS_DIR"
 
   mkdir -p "$TIMING_RESULTS_DIR"

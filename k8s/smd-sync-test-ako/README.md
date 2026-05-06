@@ -36,6 +36,22 @@ TIMING_ITEMS='10000 50000' TIMING_VALUE_SIZE=200 ./test-smd-sync-k8s.sh timing
 TIMING_REJOIN_STALE_PCT=80 TIMING_REJOIN_SECURITY_ITEMS=100000 ./test-smd-sync-k8s.sh timing-rejoin
 ```
 
+Extreme **timing-rejoin** (large security LDAP-style payload + very stale rejoining node) — raise cluster wait and use **full logs** so `sync_elapsed_us` is not truncated (`TIMING_LOG_TAIL=0` is the default for timing modes):
+
+```bash
+TIMING_REJOIN_SECURITY_ITEMS=950000 TIMING_REJOIN_STALE_PCT=99 \
+TIMING_REJOIN_CLUSTER_TIMEOUT=7200 TIMEOUT=7200 TIMING_LOG_TAIL=0 \
+TIMING_SMD_PHASE_WAIT_SEC=7200 \
+TIMING_SKIP_FINAL_CLEANUP=true \
+./test-smd-sync-k8s.sh timing-rejoin
+```
+
+`TIMING_SMD_PHASE_WAIT_SEC` — after `cluster_size=3`, heavy modules (e.g. **security**) may still be merging; the harness waits for `{security:…} full-from-pr timing` in the probe pod’s log before computing **`sync_elapsed_us`** (default **`0`** = legacy immediate scrape, often **missing security**). **`TIMING_SKIP_FINAL_CLEANUP=true`** keeps pods/PVCs up for manual `kubectl logs` and reports.
+
+Each run also appends **`*-sync-breakdown.log`** next to the TSV (filtered SMD timing lines). **`sync_elapsed_us`** prefers **`initial SMD sync done` / `sync wait done`** lines; if those are gone from the kubelet buffer, it falls back to **max over pods of Σ(`full-from-pr` `total=` μs)**.
+
+Confirm **workdir volume size** in [`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml) and [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml) is enough for generated `.smd` (default **3Gi** may be tight at ~950k security rows).
+
 Results default to `./timing-results-k8s/` under this directory (`TIMING_RESULTS_DIR`). `./test-smd-sync-k8s.sh timing-cleanup` is an alias for `cleanup-full` after a failed timing run.
 
 ## Prerequisites
@@ -183,6 +199,11 @@ From this directory (`asd-testbeds/k8s/smd-sync-test-ako/`):
 | `TIMING_AC_MANIFEST` | `manifests/aerospikecluster-timing.yaml` | Override only if you fork the timing cluster spec |
 | `TIMING_SEED_POD_TIMEOUT` | `300` | Seconds to wait for each PVC seed pod to schedule + become Ready |
 | `TIMING_PVC_SETTLE_SEC` | `5` | Brief sleep after PVC objects exist (`WaitForFirstConsumer` binds per seed pod, not all upfront) |
+| `TIMING_LOG_TAIL` | `0` | `timing` / `timing-rejoin` log scrape: **`0` = full container log** (no `--tail`); else `--tail=N` lines |
+| `TIMING_SKIP_FINAL_CLEANUP` | `false` | If **`true`**, do not delete CR/PVCs after a timing iteration (inspect logs; run `cleanup-full` later) |
+| `TIMING_SMD_PHASE_WAIT_SEC` | `0` | Seconds to poll for `{security:…}` / `{TIMING_MODULE:…}` **`full-from-pr`** line after cluster forms (**`0`** = no wait). Use **7200+** for huge timing-rejoin |
+
+Sync timing (`sync_elapsed_us`) prefers **`initial SMD sync done`** / **`sync wait done`** (`smd.c`); if absent from the scrape, uses **max over pods of Σ(`full-from-pr` `total=` μs)**. **`smd: debug`** on console is required for **`sync wait done`** — see [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml).
 
 ## Cleanup
 
