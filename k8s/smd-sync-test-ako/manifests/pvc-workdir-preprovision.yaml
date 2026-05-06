@@ -1,0 +1,53 @@
+# Pre-provision workdir PVCs so SMD can be seeded before any Aerospike pod starts.
+# Names must match AKO's StatefulSet volumeClaimTemplate pattern:
+#   {volumeName}-{statefulSetName}-{ordinal}  →  workdir-__CLUSTER_NAME__-0-{0,1,2}
+#
+# Applied by test-smd-sync-k8s.sh (timing modes) with namespace/cluster substituted.
+# Labels match workload-operator-rbac / cleanup so cleanup-full removes these PVCs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workdir-__CLUSTER_NAME__-0-0
+  namespace: __TESTBED_NAMESPACE__
+  labels:
+    app: aerospike-cluster
+    aerospike.com/cr: __CLUSTER_NAME__
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workdir-__CLUSTER_NAME__-0-1
+  namespace: __TESTBED_NAMESPACE__
+  labels:
+    app: aerospike-cluster
+    aerospike.com/cr: __CLUSTER_NAME__
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workdir-__CLUSTER_NAME__-0-2
+  namespace: __TESTBED_NAMESPACE__
+  labels:
+    app: aerospike-cluster
+    aerospike.com/cr: __CLUSTER_NAME__
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 3Gi

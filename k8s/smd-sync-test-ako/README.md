@@ -9,7 +9,34 @@ Kubernetes + [AKO](https://docs.aerospike.com/cloud/kubernetes/operator) variant
 - **Pull test topology**: A 2→3 scale adds the **highest** ordinal last; Docker starts the two higher IDs first, then the lowest. The test still checks that a **new empty member** receives SMD.
 - **Custom `asd`**: Build an image that **copies** your binary (no bind mount). Rebuild and `kind load` when you switch branches.
 
-Timing tests (`timing`, `timing-rejoin`, …) are **not** ported here (host seeding of `.smd` is awkward on Kubernetes); use the Docker bed for those.
+## Timing parity (`timing`, `timing-rejoin`)
+
+Large-SMD timing mirrors [`docker/smd-sync-test/test-smd-sync.sh`](../../docker/smd-sync-test/test-smd-sync.sh) **`timing`** and **`timing-rejoin`** modes:
+
+- **Same generators** on the host: [`docker/smd-sync-test/gen-large-smd.py`](../../docker/smd-sync-test/gen-large-smd.py) and [`docker/smd-sync-test/gen-realistic-smd.py`](../../docker/smd-sync-test/gen-realistic-smd.py) (requires **`python3`** on the machine running the harness).
+- **Pre-provisioned PVCs** — [`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml) creates `workdir-<cluster>-0-{0,1,2}` claims before the `AerospikeCluster` exists so the StatefulSet adopts them (same naming pattern AKO uses).
+- **Seeding** — short-lived `busybox` pods mount each PVC at `/opt/aerospike`, reset `smd/`, and `kubectl cp` generated `.smd` files from the host staging dir (`SMD_DATA_DIR`, default `/tmp/smd-timing-k8s-data`).
+- **`initMethod: none`** — [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml) matches the normal cluster spec but sets `filesystemVolumePolicy.initMethod: none` so **`aerospike-init` does not delete pre-seeded files** on the workdir volume (the default bed uses `deleteFiles`, which would wipe staged SMD).
+
+**Not ported** (still Docker-only in this repo): `timing-real`, `timing-conflict`, `show-limits` — same rationale as before (extra scenarios; add similarly if needed).
+
+**Interpretation:** Wall-clock and `initial SMD sync wait done - elapsed … us` / `sync wait done …` lines match the Docker script’s parsing. Total time includes Kubernetes-specific costs (CSI attach, init containers, scheduling); compare runs on the same cluster image/config when benchmarking.
+
+After the usual prerequisites (kind, operator, server image, secrets):
+
+```bash
+./test-smd-sync-k8s.sh timing
+./test-smd-sync-k8s.sh timing-rejoin
+```
+
+Tune sweeps with the same-style env vars as Docker (see [`docker/smd-sync-test/README.md`](../../docker/smd-sync-test/README.md)), for example:
+
+```bash
+TIMING_ITEMS='10000 50000' TIMING_VALUE_SIZE=200 ./test-smd-sync-k8s.sh timing
+TIMING_REJOIN_STALE_PCT=80 TIMING_REJOIN_SECURITY_ITEMS=100000 ./test-smd-sync-k8s.sh timing-rejoin
+```
+
+Results default to `./timing-results-k8s/` under this directory (`TIMING_RESULTS_DIR`). `./test-smd-sync-k8s.sh timing-cleanup` is an alias for `cleanup-full` after a failed timing run.
 
 ## Prerequisites
 
@@ -92,6 +119,8 @@ From this directory (`asd-testbeds/k8s/smd-sync-test-ako/`):
    ./test-smd-sync-k8s.sh basic
    ./test-smd-sync-k8s.sh all
    ./test-smd-sync-k8s.sh auth
+   ./test-smd-sync-k8s.sh timing
+   ./test-smd-sync-k8s.sh timing-rejoin
    ```
 
 ## Bring your own cluster
@@ -121,6 +150,8 @@ From this directory (`asd-testbeds/k8s/smd-sync-test-ako/`):
 | [`manifests/aerospikecluster-security.yaml`](manifests/aerospikecluster-security.yaml) | ACL + `security: {}` for `auth` test |
 | [`manifests/aerospikecluster-size1.yaml`](manifests/aerospikecluster-size1.yaml) | `spec.size: 1` |
 | [`manifests/aerospikecluster-size2.yaml`](manifests/aerospikecluster-size2.yaml) | `spec.size: 2` |
+| [`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml) | Pre-create workdir PVCs for timing seeding (namespaced/cluster substituted by script) |
+| [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml) | 3-node cluster with `initMethod: none` for large-SMD timing |
 
 ## Environment variables
 
@@ -140,6 +171,18 @@ From this directory (`asd-testbeds/k8s/smd-sync-test-ako/`):
 | `ADMIN_PASSWORD` | `admin123` | Admin password in `auth-secret` / `auth` test |
 | `TIMEOUT` | `300` | Wait timeouts (seconds) |
 | `CLEANUP_ON_SUCCESS` | `false` | If `true`, `all` deletes CR/PVCs after success |
+| `SMD_DATA_DIR` | `/tmp/smd-timing-k8s-data` | Host staging for generated `.smd` before `kubectl cp` |
+| `TIMING_RESULTS_DIR` | `<this-dir>/timing-results-k8s` | TSV + phase logs from `timing` / `timing-rejoin` |
+| `TIMING_ITEMS` | (same sweep as Docker `test-smd-sync.sh`) | Space-separated counts for `timing` |
+| `TIMING_VALUE_SIZE` | `200` | Bytes per synthetic value (`timing`) |
+| `TIMING_MODULE` | `evict` | SMD module for synthetic payload (`timing`) |
+| `TIMING_CLUSTER_TIMEOUT` | `300` | Seconds to wait for `cluster_size=3` (`timing`) |
+| `TIMING_REJOIN_CLUSTER_TIMEOUT` | `600` | Same for `timing-rejoin` (heavier dataset) |
+| `TIMING_REJOIN_STALE_PCT` | `80` | Stale fraction on ordinal 2 pod’s PVC (`timing-rejoin`) |
+| `TIMING_REJOIN_SECURITY_ITEMS` | `100000` | Security module item count (`timing-rejoin`) |
+| `TIMING_AC_MANIFEST` | `manifests/aerospikecluster-timing.yaml` | Override only if you fork the timing cluster spec |
+| `TIMING_SEED_POD_TIMEOUT` | `300` | Seconds to wait for each PVC seed pod to schedule + become Ready |
+| `TIMING_PVC_SETTLE_SEC` | `5` | Brief sleep after PVC objects exist (`WaitForFirstConsumer` binds per seed pod, not all upfront) |
 
 ## Cleanup
 
@@ -249,3 +292,15 @@ git submodule update --init --recursive
 ```
 
 Confirm `pkg/configschema/schemas/json/aerospike` exists, then rebuild the image.
+
+### Timing: seed pod stuck `Pending` / `kubectl exec`: pod does not have a host assigned
+
+RWO volumes on kind often spend a while in **Pending** before the scheduler assigns a node and the volume attaches. The script waits up to **`TIMING_SEED_POD_TIMEOUT`** (default 300s) and prints progress every 30s; increase it if your cluster is slow.
+
+If **`kubectl get pvc`** shows ordinals **1–2** stuck **Pending** while ordinal **0** is Bound, that is normal under **`WaitForFirstConsumer`**: those volumes bind only when the corresponding seed pod schedules (the harness never waited for all three Bound).
+
+After an interrupted run, delete leftover seed pods:
+
+```bash
+kubectl delete pods -n smd-sync-ako -l smd-sync-test=seed --ignore-not-found
+```

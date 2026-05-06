@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_DIR="$SCRIPT_DIR/manifests"
+DOCKER_SMD_TEST="$(cd "$SCRIPT_DIR/../../docker/smd-sync-test" && pwd)"
 
 NS="${NAMESPACE:-smd-sync-ako}"
 CLUSTER="${CLUSTER_NAME:-smdsync}"
@@ -20,6 +21,21 @@ STS_NAME="${CLUSTER}-0"
 WORKDIR_VOL="${WORKDIR_VOL_NAME:-workdir}"
 
 LABEL_SELECTOR="app=aerospike-cluster,aerospike.com/cr=${CLUSTER}"
+
+# Large-SMD timing (parity with docker/smd-sync-test/test-smd-sync.sh timing / timing-rejoin).
+SMD_DATA_DIR="${SMD_DATA_DIR:-/tmp/smd-timing-k8s-data}"
+TIMING_RESULTS_DIR="${TIMING_RESULTS_DIR:-${SCRIPT_DIR}/timing-results-k8s}"
+TIMING_MODULE="${TIMING_MODULE:-evict}"
+TIMING_VALUE_SIZE="${TIMING_VALUE_SIZE:-200}"
+TIMING_ITEMS="${TIMING_ITEMS:-10000 50000 100000 200000 300000 400000}"
+TIMING_CLUSTER_TIMEOUT="${TIMING_CLUSTER_TIMEOUT:-300}"
+TIMING_REJOIN_CLUSTER_TIMEOUT="${TIMING_REJOIN_CLUSTER_TIMEOUT:-600}"
+TIMING_REJOIN_STALE_PCT="${TIMING_REJOIN_STALE_PCT:-80}"
+TIMING_REJOIN_SECURITY_ITEMS="${TIMING_REJOIN_SECURITY_ITEMS:-100000}"
+TIMING_AC_MANIFEST="${TIMING_AC_MANIFEST:-$MANIFEST_DIR/aerospikecluster-timing.yaml}"
+# Seed pods mount RWO PVCs on kind/CSI; first attach can sit Pending for a while — avoid kubectl wait Ready until scheduled.
+TIMING_SEED_POD_TIMEOUT="${TIMING_SEED_POD_TIMEOUT:-300}"
+TIMING_PVC_SETTLE_SEC="${TIMING_PVC_SETTLE_SEC:-5}"
 
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-smd-sync-ako}"
 
@@ -152,19 +168,32 @@ apply_namespace() {
   sed "s/__TESTBED_NAMESPACE__/${NS}/g" "$MANIFEST_DIR/workload-operator-rbac.yaml" | kubectl apply -f -
 }
 
-cleanup_full() {
-  log "Cleaning up AerospikeCluster and PVCs..."
-  kubectl delete aerospikecluster "$CLUSTER" -n "$NS" --ignore-not-found --wait=true --timeout=600s || true
-  kubectl delete pvc -n "$NS" -l "$LABEL_SELECTOR" --ignore-not-found --wait=false || true
-  local wait_n=0
-  while kubectl get pvc -n "$NS" -l "$LABEL_SELECTOR" -o name 2>/dev/null | grep -q .; do
+# Seed pods hold RWO mounts; CR deletion alone may leave PVCs terminating for a long time.
+wait_workdir_pvcs_absent() {
+  local wait_n=0 i name
+  while [[ $wait_n -lt 360 ]]; do
+    local any=0
+    for i in 0 1 2; do
+      name=$(pvc_for_ordinal "$i")
+      if kubectl get pvc -n "$NS" "$name" &>/dev/null; then
+        any=1
+        break
+      fi
+    done
+    [[ $any -eq 0 ]] && return 0
     sleep 2
     wait_n=$((wait_n + 1))
-    if [[ $wait_n -gt 150 ]]; then
-      log "WARN: PVCs still present after timeout"
-      break
-    fi
   done
+  log "WARN: timed out waiting for workdir PVCs to finish deleting (scheduler will reject new pods while a claim is terminating)"
+  return 1
+}
+
+cleanup_full() {
+  log "Cleaning up AerospikeCluster and PVCs..."
+  kubectl delete pods -n "$NS" -l smd-sync-test=seed --ignore-not-found --wait=false 2>/dev/null || true
+  kubectl delete aerospikecluster "$CLUSTER" -n "$NS" --ignore-not-found --wait=true --timeout=600s || true
+  kubectl delete pvc -n "$NS" -l "$LABEL_SELECTOR" --ignore-not-found --wait=false || true
+  wait_workdir_pvcs_absent || true
   kubectl delete clusterrolebinding "aerospike-operator-workload-${NS}" --ignore-not-found || true
   kubectl delete clusterrolebinding "aerospike-operator-workload-nodes-${NS}" --ignore-not-found || true
   kubectl delete clusterrole "aerospike-operator-workload-nodes-${NS}" --ignore-not-found || true
@@ -405,6 +434,484 @@ test_pull_join() {
   log "Test 5 complete"
 }
 
+timing_log() {
+  echo "[$(date '+%H:%M:%S')] [timing-k8s] $*" >&2
+}
+
+require_timing_python() {
+  command -v python3 >/dev/null 2>&1 || {
+    log "ERROR: python3 is required on the host (same as Docker timing)."
+    return 1
+  }
+  true
+}
+
+timing_apply_preprovision_pvcs() {
+  sed -e "s/__TESTBED_NAMESPACE__/${NS}/g" -e "s/__CLUSTER_NAME__/${CLUSTER}/g" \
+    "$MANIFEST_DIR/pvc-workdir-preprovision.yaml" | kubectl apply -f -
+}
+
+# Many clusters use WaitForFirstConsumer: PVCs for ordinals 1–2 stay Pending until a pod mounts them.
+# Waiting for all PVCs to be Bound before any seed pod runs deadlocks forever — only verify objects exist.
+timing_wait_preprovision_pvcs_created() {
+  local i n name
+  for i in 0 1 2; do
+    name=$(pvc_for_ordinal "$i")
+    n=0
+    while [[ $n -lt 120 ]]; do
+      if kubectl get pvc -n "$NS" "$name" &>/dev/null; then
+        break
+      fi
+      sleep 1
+      ((n++)) || true
+    done
+    if ! kubectl get pvc -n "$NS" "$name" &>/dev/null; then
+      timing_log "ERROR: PVC $name not present after apply"
+      return 1
+    fi
+  done
+  timing_log "PVC objects present (WaitForFirstConsumer: binding happens when each seed pod schedules)."
+}
+
+timing_pause_after_pvcs_created() {
+  if [[ "${TIMING_PVC_SETTLE_SEC}" =~ ^[0-9]+$ ]] && [[ "$TIMING_PVC_SETTLE_SEC" -gt 0 ]]; then
+    timing_log "Waiting ${TIMING_PVC_SETTLE_SEC}s after PVC apply (API/provisioner warm-up)..."
+    sleep "$TIMING_PVC_SETTLE_SEC"
+  fi
+}
+
+# Wait until pod has a node and is Running, then Ready — Pending pods are not Ready, so
+# `kubectl wait Ready` alone fails with "does not have a host assigned" on kubectl exec.
+wait_seed_pod_scheduled_and_ready() {
+  local pod=$1
+  local timeout_sec=${2:-$TIMING_SEED_POD_TIMEOUT}
+  local elapsed=0
+  local phase="" node=""
+
+  timing_log "Waiting for seed pod $pod (schedule + Ready, timeout ${timeout_sec}s)..."
+
+  while [[ $elapsed -lt $timeout_sec ]]; do
+    phase=$(kubectl get pod -n "$NS" "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || echo Missing)
+    node=$(kubectl get pod -n "$NS" "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+
+    if [[ "$phase" == "Failed" || "$phase" == "Succeeded" ]]; then
+      timing_log "Seed pod $pod ended with phase=$phase"
+      kubectl describe pod -n "$NS" "$pod" 2>/dev/null | tail -40 >&2
+      return 1
+    fi
+
+    if [[ "$phase" == "Running" && -n "$node" ]]; then
+      if kubectl wait --for=condition=Ready "pod/$pod" -n "$NS" --timeout=120s 2>/dev/null; then
+        return 0
+      fi
+      timing_log "WARN: pod Running on $node but not Ready yet; continuing to wait..."
+    fi
+
+    # Every ~30s while Pending, log so the harness does not look hung (kind PVC attach can be slow).
+    if [[ "$phase" == "Pending" && "$elapsed" -gt 0 && $((elapsed % 30)) -eq 0 ]]; then
+      timing_log "Seed pod $pod still Pending (${elapsed}s/${timeout_sec}s) — typical on kind while volume attaches."
+      kubectl get pod -n "$NS" "$pod" -o wide 2>/dev/null >&2 || true
+    fi
+
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  timing_log "ERROR: seed pod $pod did not become Ready in ${timeout_sec}s (phase=$phase node=${node:-none})"
+  kubectl get pod -n "$NS" "$pod" -o wide 2>/dev/null >&2 || true
+  kubectl describe pod -n "$NS" "$pod" 2>/dev/null | tail -45 >&2
+  return 1
+}
+
+# Mount one workdir PVC in a busybox pod, reset smd/, optionally kubectl cp .smd files from host.
+seed_workdir_smd_from_host() {
+  local ord=$1
+  local host_smd_dir=$2
+  local pod="smd-seed-${ord}-$$"
+  local claim
+  claim=$(pvc_for_ordinal "$ord")
+
+  kubectl delete pod -n "$NS" "$pod" --ignore-not-found --wait=true 2>/dev/null || true
+
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  namespace: $NS
+  labels:
+    smd-sync-test: seed
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: seed
+    image: busybox:1.36
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+    volumeMounts:
+    - name: w
+      mountPath: /opt/aerospike
+  volumes:
+  - name: w
+    persistentVolumeClaim:
+      claimName: $claim
+  restartPolicy: Never
+EOF
+
+  wait_seed_pod_scheduled_and_ready "$pod" "$TIMING_SEED_POD_TIMEOUT" || return 1
+
+  kubectl exec -n "$NS" "$pod" -- sh -c 'mkdir -p /opt/aerospike/smd && rm -rf /opt/aerospike/smd/* 2>/dev/null; true'
+
+  local f
+  if [[ -d "$host_smd_dir" ]]; then
+    shopt -s nullglob
+    local smds=( "${host_smd_dir}"/*.smd )
+    shopt -u nullglob
+    if [[ ${#smds[@]} -gt 0 ]]; then
+      for f in "${smds[@]}"; do
+        kubectl cp -n "$NS" "$f" "$pod:/opt/aerospike/smd/$(basename "$f")"
+      done
+    fi
+  fi
+
+  kubectl delete pod -n "$NS" "$pod" --wait=true
+}
+
+timing_prepare_host_large_smd() {
+  local n_items=$1
+  mkdir -p "${SMD_DATA_DIR}/node1/smd" "${SMD_DATA_DIR}/node2/smd" "${SMD_DATA_DIR}/node3/smd"
+  rm -rf "${SMD_DATA_DIR}/node1/smd"/* "${SMD_DATA_DIR}/node2/smd"/* "${SMD_DATA_DIR}/node3/smd"/* 2>/dev/null || true
+  mkdir -p "${SMD_DATA_DIR}/node1/smd" "${SMD_DATA_DIR}/node2/smd" "${SMD_DATA_DIR}/node3/smd"
+
+  python3 "$DOCKER_SMD_TEST/gen-large-smd.py" \
+    --items "$n_items" \
+    --module "$TIMING_MODULE" \
+    --value-size "$TIMING_VALUE_SIZE" \
+    --out "${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd"
+
+  local smd_file="${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd"
+  timing_log "Host: node1 SMD $(du -sh "$smd_file" 2>/dev/null | cut -f1) ($smd_file)"
+}
+
+# Wall-clock ms until cluster_size=N (polls lowest-ordinal Ready pod). Prints ms to stdout only.
+timing_wait_cluster_ms() {
+  local expected=$1
+  local timeout_sec=${2:-300}
+  local elapsed=0
+  local size=0
+  local probe_pod=""
+  local t_start
+  t_start=$(date +%s%N)
+
+  timing_log "Waiting for cluster_size=$expected (timeout ${timeout_sec}s)..."
+
+  while [[ $elapsed -lt $timeout_sec ]]; do
+    probe_pod=$(list_pods_sorted | head -n1 || true)
+    if [[ -n "$probe_pod" ]] && pod_ready "$probe_pod"; then
+      if [[ "${USE_AUTH:-0}" == "1" ]]; then
+        size=$(kubectl exec -n "$NS" "$probe_pod" -c aerospike-server -- \
+          timeout 5 asinfo -Uadmin -P"$ADMIN_PASSWORD" -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo 0)
+      else
+        size=$(kubectl exec -n "$NS" "$probe_pod" -c aerospike-server -- \
+          timeout 5 asinfo -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' || echo 0)
+      fi
+      if [[ "$size" == "$expected" ]]; then
+        local t_end ms
+        t_end=$(date +%s%N)
+        ms=$(( (t_end - t_start) / 1000000 ))
+        timing_log "Cluster formed (size $size) in ${ms} ms"
+        echo "$ms"
+        return 0
+      fi
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  timing_log "ERROR: cluster_size did not reach $expected within ${timeout_sec}s (last size=$size)"
+  echo "-1"
+  return 0
+}
+
+timing_extract_sync_us_k8s() {
+  local probe_pod
+  probe_pod="$(pod_at_index 0)"
+  local logs
+  logs=$(kubectl logs -n "$NS" "$probe_pod" -c aerospike-server --tail=100000 2>&1 || true)
+  local sync_us
+  sync_us=$(echo "$logs" \
+    | grep -oP '(?:initial SMD sync wait done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
+    | sort -n | tail -1 || true)
+  if [[ -n "$sync_us" ]]; then
+    echo "$sync_us"
+  else
+    echo "-1"
+  fi
+}
+
+timing_prepare_host_rejoin() {
+  local stale_pct=$1
+  local security_items=$2
+  local script_dir="$DOCKER_SMD_TEST"
+
+  timing_log "Host rejoin dataset: stale_pct=${stale_pct}% security_items=$security_items"
+
+  local node
+  for node in 1 2 3; do
+    rm -rf "${SMD_DATA_DIR}/node${node}/smd"
+    mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
+  done
+
+  local module
+  for module in truncate sindex security masking; do
+    if [[ "$module" == "security" ]]; then
+      python3 "$script_dir/gen-realistic-smd.py" \
+        --out-dir "${SMD_DATA_DIR}/node1/smd" \
+        --module "$module" \
+        --items "$security_items"
+    else
+      python3 "$script_dir/gen-realistic-smd.py" \
+        --out-dir "${SMD_DATA_DIR}/node1/smd" \
+        --module "$module"
+    fi
+  done
+
+  cp -r "${SMD_DATA_DIR}/node1/smd/"* "${SMD_DATA_DIR}/node2/smd/"
+
+  timing_log "Stale subset for node 3 (${stale_pct}% of items)..."
+  python3 << EOF
+import json
+import os
+
+stale_pct = int("$stale_pct")
+node1_smd_dir = "${SMD_DATA_DIR}/node1/smd"
+node3_smd_dir = "${SMD_DATA_DIR}/node3/smd"
+
+for smd_file in os.listdir(node1_smd_dir):
+    if not smd_file.endswith(".smd"):
+        continue
+    with open(os.path.join(node1_smd_dir, smd_file)) as f:
+        items = json.load(f)
+    header = items[0]
+    data_items = items[1:]
+    n_stale = int(len(data_items) * stale_pct / 100)
+    stale_items = []
+    for item in data_items[:n_stale]:
+        stale_item = dict(item)
+        stale_item["generation"] = max(1, item["generation"] - 1)
+        stale_item["timestamp"] = item["timestamp"] - 1000000
+        stale_items.append(stale_item)
+    node3_data = [header] + stale_items
+    out_path = os.path.join(node3_smd_dir, smd_file)
+    with open(out_path, "w") as f:
+        json.dump(node3_data, f, separators=(",", ":"))
+    if data_items:
+        print(f"  {smd_file}: {len(data_items)} current -> {len(stale_items)} stale")
+EOF
+}
+
+timing_run_one_k8s() {
+  local n_items=$1
+  local results_file=$2
+
+  cleanup_full
+  USE_AUTH=0
+  apply_namespace
+
+  timing_prepare_host_large_smd "$n_items"
+
+  timing_apply_preprovision_pvcs
+  timing_wait_preprovision_pvcs_created
+  timing_pause_after_pvcs_created
+
+  seed_workdir_smd_from_host 0 "${SMD_DATA_DIR}/node1/smd"
+  seed_workdir_smd_from_host 1 "${SMD_DATA_DIR}/node2/smd"
+  seed_workdir_smd_from_host 2 "${SMD_DATA_DIR}/node3/smd"
+
+  kubectl apply -f "$TIMING_AC_MANIFEST"
+
+  local wall_ms
+  wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_CLUSTER_TIMEOUT")
+
+  local sync_us
+  sync_us=$(timing_extract_sync_us_k8s)
+
+  if [[ "$wall_ms" == "-1" ]]; then
+    timing_log "FAIL: cluster did not form for n_items=$n_items"
+    cleanup_full
+    return 1
+  fi
+
+  local sync_ms="n/a"
+  if [[ "$sync_us" != "-1" ]]; then
+    sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+  fi
+
+  local timed_out=0
+  if collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+    timed_out=1
+    timing_log "WARNING: SMD sync timed out (see pod logs)"
+  fi
+
+  local smd_mb
+  smd_mb=$(python3 -c "import os; print(f'{os.path.getsize(\"${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd\") / 1048576:.2f}')")
+
+  timing_log "RESULT: items=$n_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms}ms (${sync_us}us) timeout=${timed_out}"
+
+  echo -e "${n_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
+
+  local phase_log="${results_file%.tsv}-phases.log"
+  timing_log "Phase timing -> $phase_log"
+  collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" | sed "s/^/[n=${n_items}] /" >> "$phase_log"
+
+  cleanup_full
+}
+
+test_large_smd_timing_k8s() {
+  require_timing_python || return 1
+  [[ -f "$DOCKER_SMD_TEST/gen-large-smd.py" ]] || {
+    log "ERROR: expected $DOCKER_SMD_TEST/gen-large-smd.py"
+    return 1
+  }
+  kubectl get secret aerospike-secret -n "$NS" >/dev/null 2>&1 || {
+    log "ERROR: Secret aerospike-secret not found in $NS (run scripts/create-secrets.sh)."
+    return 1
+  }
+
+  timing_log "=== SMD large-payload timing sweep (AKO / preprovisioned PVCs) ==="
+  timing_log "Docker helpers: $DOCKER_SMD_TEST"
+  timing_log "Sweep items=${TIMING_ITEMS} value_size=${TIMING_VALUE_SIZE}B"
+  timing_log "Cluster manifest: $TIMING_AC_MANIFEST (initMethod: none preserves seeded SMD)"
+  timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+  mkdir -p "$TIMING_RESULTS_DIR"
+  local results_file="${TIMING_RESULTS_DIR}/timing-k8s-$(date '+%Y%m%d-%H%M%S').tsv"
+  echo -e "items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tvalue_size_b\tsync_timeout" > "$results_file"
+  timing_log "Results file: $results_file"
+
+  local failed=0 n
+  for n in $TIMING_ITEMS; do
+    timing_run_one_k8s "$n" "$results_file" || failed=1
+  done
+
+  if [[ $failed -eq 0 ]]; then
+    timing_log "=== Timing sweep COMPLETE ==="
+    column -t "$results_file"
+  else
+    timing_log "=== Timing sweep had FAILURES ==="
+    return 1
+  fi
+}
+
+timing_rejoin_run_k8s() {
+  local results_file=$1
+
+  cleanup_full
+  USE_AUTH=0
+  apply_namespace
+
+  timing_prepare_host_rejoin "$TIMING_REJOIN_STALE_PCT" "$TIMING_REJOIN_SECURITY_ITEMS"
+
+  timing_apply_preprovision_pvcs
+  timing_wait_preprovision_pvcs_created
+  timing_pause_after_pvcs_created
+
+  seed_workdir_smd_from_host 0 "${SMD_DATA_DIR}/node1/smd"
+  seed_workdir_smd_from_host 1 "${SMD_DATA_DIR}/node2/smd"
+  seed_workdir_smd_from_host 2 "${SMD_DATA_DIR}/node3/smd"
+
+  kubectl apply -f "$TIMING_AC_MANIFEST"
+
+  local wall_ms
+  wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_REJOIN_CLUSTER_TIMEOUT")
+
+  local sync_us
+  sync_us=$(timing_extract_sync_us_k8s)
+
+  if [[ "$wall_ms" == "-1" ]]; then
+    timing_log "FAIL: cluster did not form (timing-rejoin)"
+    cleanup_full
+    return 1
+  fi
+
+  local sync_ms="n/a"
+  if [[ "$sync_us" != "-1" ]]; then
+    sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+  fi
+
+  local timed_out=0
+  if collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+    timed_out=1
+    timing_log "WARNING: SMD sync timed out"
+  fi
+
+  local current_items stale_items smd_mb
+  current_items=$(python3 -c "
+import json, os
+total = 0
+for f in os.listdir('${SMD_DATA_DIR}/node1/smd'):
+    if f.endswith('.smd'):
+        total += len(json.load(open('${SMD_DATA_DIR}/node1/smd/' + f))) - 1
+print(total)
+")
+  stale_items=$(python3 -c "
+import json, os
+total = 0
+for f in os.listdir('${SMD_DATA_DIR}/node3/smd'):
+    if f.endswith('.smd'):
+        total += len(json.load(open('${SMD_DATA_DIR}/node3/smd/' + f))) - 1
+print(total)
+")
+  smd_mb=$(python3 -c "
+import os
+total = 0
+for n in (1, 2, 3):
+    d = '${SMD_DATA_DIR}/node' + str(n) + '/smd'
+    for f in os.listdir(d):
+        total += os.path.getsize(os.path.join(d, f))
+print(f'{total / 1048576:.2f}')
+")
+
+  timing_log "RESULT: stale_pct=$TIMING_REJOIN_STALE_PCT current=$current_items stale=$stale_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms}ms (${sync_us}us) timeout=${timed_out}"
+
+  echo -e "${TIMING_REJOIN_STALE_PCT}\t${current_items}\t${stale_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${timed_out}" >> "$results_file"
+
+  local phase_log="${results_file%.tsv}-phases.log"
+  collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" \
+    | sed "s/^/[rejoin:${TIMING_REJOIN_STALE_PCT}%] /" >> "$phase_log"
+
+  cleanup_full
+}
+
+test_rejoin_smd_timing_k8s() {
+  require_timing_python || return 1
+  [[ -f "$DOCKER_SMD_TEST/gen-realistic-smd.py" ]] || {
+    log "ERROR: expected $DOCKER_SMD_TEST/gen-realistic-smd.py"
+    return 1
+  }
+  kubectl get secret aerospike-secret -n "$NS" >/dev/null 2>&1 || {
+    log "ERROR: Secret aerospike-secret not found in $NS (run scripts/create-secrets.sh)."
+    return 1
+  }
+
+  timing_log "=== Rejoin SMD timing (AKO) ==="
+  timing_log "Stale %: $TIMING_REJOIN_STALE_PCT  security items: $TIMING_REJOIN_SECURITY_ITEMS"
+  timing_log "Results dir: $TIMING_RESULTS_DIR"
+
+  mkdir -p "$TIMING_RESULTS_DIR"
+  local results_file="${TIMING_RESULTS_DIR}/timing-rejoin-k8s-$(date '+%Y%m%d-%H%M%S').tsv"
+  echo -e "stale_pct\tcurrent_items\tstale_items\tsmd_mb\twall_cluster_ms\tsync_elapsed_us\tsync_timeout" > "$results_file"
+
+  timing_rejoin_run_k8s "$results_file"
+
+  timing_log "=== Rejoin timing COMPLETE ==="
+  column -t "$results_file"
+}
+
 run_all() {
   local failed=0
   test_basic_sync_ordering || failed=1
@@ -426,13 +933,13 @@ run_all() {
 }
 
 case "${1:-}" in
-  basic|auth|rejoin|preexisting|pull|all|cleanup-full)
+  basic|auth|rejoin|preexisting|pull|all|cleanup-full|timing|timing-rejoin|timing-cleanup)
     require_kubectl_cluster
     ;;
 esac
 
 case "${1:-}" in
-  basic|auth|rejoin|preexisting|pull|all)
+  basic|auth|rejoin|preexisting|pull|all|timing|timing-rejoin)
     require_aerospike_crd
     ;;
 esac
@@ -445,12 +952,17 @@ case "${1:-}" in
   pull) test_pull_join ;;
   all) run_all ;;
   cleanup-full) cleanup_full ;;
+  timing) test_large_smd_timing_k8s ;;
+  timing-rejoin) test_rejoin_smd_timing_k8s ;;
+  timing-cleanup) cleanup_full ;;
   *)
-    echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|cleanup-full}"
+    echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|all|timing|timing-rejoin|cleanup-full|timing-cleanup}"
     echo ""
     echo "Requires: kubectl, Aerospike Kubernetes Operator, namespace/secrets (see README)."
+    echo "timing / timing-rejoin also need python3 on the host and docker/smd-sync-test generators."
     echo "Env: NAMESPACE=$NS CLUSTER_NAME=$CLUSTER TIMEOUT=$TIMEOUT ADMIN_PASSWORD=..."
     echo "     USE_AUTH is set internally; non-auth tests use open asinfo."
+    echo "Timing env (see README): SMD_DATA_DIR TIMING_ITEMS TIMING_* TIMING_RESULTS_DIR ..."
     exit 1
     ;;
 esac
