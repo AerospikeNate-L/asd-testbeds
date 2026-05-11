@@ -31,7 +31,7 @@ services:
     volumes:
       - ./conf-security/aerospike-node1.conf:/etc/aerospike/aerospike.conf
       - ./conf-security/features.conf:/etc/aerospike/features.conf
-      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${ASD_BINARY_NODE1:-${ASD_BINARY:-../bin/asd}}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node1/log:/var/log/aerospike
     privileged: true
@@ -59,7 +59,7 @@ services:
     volumes:
       - ./conf-security/aerospike-node2.conf:/etc/aerospike/aerospike.conf
       - ./conf-security/features.conf:/etc/aerospike/features.conf
-      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${ASD_BINARY_NODE2:-${ASD_BINARY:-../bin/asd}}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node2/log:/var/log/aerospike
     privileged: true
@@ -87,7 +87,7 @@ services:
     volumes:
       - ./conf-security/aerospike-node3.conf:/etc/aerospike/aerospike.conf
       - ./conf-security/features.conf:/etc/aerospike/features.conf
-      - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
+      - ${ASD_BINARY_NODE3:-${ASD_BINARY:-../bin/asd}}:/usr/bin/asd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/smd:/opt/aerospike/smd
       - ${SMD_DATA_DIR:-/tmp/smd-timing-data}/node3/log:/var/log/aerospike
     privileged: true

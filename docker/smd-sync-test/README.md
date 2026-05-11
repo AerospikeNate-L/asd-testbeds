@@ -23,6 +23,9 @@ tests are deterministic and repeatable.
 | `rejoin` | Node 3 (principal) rejoins with cleared SMD, syncs from other nodes |
 | `preexisting` | Node 1 starts first with SMD data, nodes 2 and 3 join empty |
 | `pull` | Nodes 2 and 3 start with SMD, node 1 joins and receives SMD |
+| `identical` | Restart all nodes with identical pre-existing SMD |
+| `full-ack-order` | Principal readiness waits for NPR `FULL_FROM_PR` apply completion |
+| `mixed-fail-open` | Mixed-version cluster releases fail-open SMD sync waiters promptly |
 
 ## Prerequisites
 
@@ -106,6 +109,19 @@ Tests that a new node joining an existing cluster receives SMD.
 2. Start node 1 (fresh, joins existing cluster)
 3. Verify node 1 receives sindex via SMD sync
 4. Verify all nodes have the sindex
+
+### Test 6: Identical Pre-existing SMD (`identical`)
+
+Restarts all nodes with matching SMD and verifies the cluster starts without an
+initial sync timeout.
+
+### Mixed-Version Fail-Open (`mixed-fail-open`)
+
+Runs a mixed-version cluster with one node using `OLD_ASD_BINARY`. This exercises
+the compatibility fail-open path and verifies new-version nodes complete
+`as_smd_cluster_changed_sync()` promptly instead of waiting for an unrelated
+readiness probe. If the old binary was built for a different distro, set
+`MIXED_FAIL_OPEN_OLD_IMAGE` to run node 3 with a compatible image.
 
 ## Configuration Files
 
