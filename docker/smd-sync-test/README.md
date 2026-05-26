@@ -23,6 +23,9 @@ tests are deterministic and repeatable.
 | `rejoin` | Node 3 (principal) rejoins with cleared SMD, syncs from other nodes |
 | `preexisting` | Node 1 starts first with SMD data, nodes 2 and 3 join empty |
 | `pull` | Nodes 2 and 3 start with SMD, node 1 joins and receives SMD |
+| `identical` | Restart all nodes with identical pre-existing SMD |
+| `full-ack-order` | Principal readiness waits for NPR `FULL_FROM_PR` apply completion |
+| `mixed-fail-open` | Mixed-version cluster releases fail-open SMD sync waiters promptly |
 
 ## Prerequisites
 
@@ -66,8 +69,8 @@ and is not included in `all` to avoid config conflicts.
 Verifies SMD sync completes before partition balance on fresh cluster formation.
 
 **What it checks:**
-- "sync wait start" appears in logs
-- "sync wait done" or "all modules settled" appears
+- "sync wait start" may appear in logs (DETAIL `smd` context — configs use `context smd detail`)
+- "sync wait done" or "all modules settled" may appear (same)
 - No "SMD sync timed out" warning
 
 ### Test 2: Security SMD Sync (`auth`)
@@ -107,6 +110,19 @@ Tests that a new node joining an existing cluster receives SMD.
 3. Verify node 1 receives sindex via SMD sync
 4. Verify all nodes have the sindex
 
+### Test 6: Identical Pre-existing SMD (`identical`)
+
+Restarts all nodes with matching SMD and verifies the cluster starts without an
+initial sync timeout.
+
+### Mixed-Version Fail-Open (`mixed-fail-open`)
+
+Runs a mixed-version cluster with one node using `OLD_ASD_BINARY`. This exercises
+the compatibility fail-open path and verifies new-version nodes complete
+`as_smd_cluster_changed_sync()` promptly instead of waiting for an unrelated
+readiness probe. If the old binary was built for a different distro, set
+`MIXED_FAIL_OPEN_OLD_IMAGE` to run node 3 with a compatible image.
+
 ## Configuration Files
 
 | File | Description |
@@ -114,21 +130,31 @@ Tests that a new node joining an existing cluster receives SMD.
 | `conf/aerospike-node[1-3].conf` | Node configs without security (for sindex tests) |
 | `conf-security/aerospike-node[1-3].conf` | Node configs with security enabled (for auth test) |
 | `conf/features.conf` | Enterprise license file |
+| `conf-security/features.conf` | Enterprise license file (auth / timing compose) |
 | `docker-compose.yaml` | Default compose (no security) |
 | `docker-compose-security.yaml` | Security-enabled compose (for auth test) |
 
-## Debug Logging
+## Diagnostic logging (SMD / exchange)
 
-The node configs have debug logging enabled for `smd` and `exchange` contexts.
-Look for these log messages:
+The node configs set **`context smd detail`** and **`context exchange debug`** so
+exchange-path sync wait lines are visible without shipping DEBUG-level `smd` logs
+in production defaults.
+
+Look for these messages (shown as DETAIL in the log prefix):
 
 ```
-DEBUG (smd): sync wait start cl_key XXX size N
-DEBUG (smd): all modules settled - signaling sync complete
-DEBUG (smd): sync wait done cl_key XXX elapsed NNN us
+DETAIL (smd): sync wait start cl_key XXX size N
+DETAIL (smd): all modules settled - signaling sync complete
+DETAIL (smd): sync wait done cl_key XXX elapsed NNN us
 ```
 
-If you see this warning, there's a problem:
+INFO-level startup lines (always at default `context any info`) include
+`initial SMD sync done - elapsed NNN us` on secure clusters and `initial sync done`
+when all modules have settled.
+
+The historical warning below is **not** emitted by current fail-closed `as_smd_wait_ready()`;
+if it appears in old logs only, treat as legacy:
+
 ```
 WARNING (smd): SMD sync timed out after 30 seconds - proceeding anyway
 ```
@@ -178,7 +204,7 @@ TIMING_REJOIN_SECURITY_ITEMS=450000 TIMING_REJOIN_STALE_PCT=95 ./test-smd-sync.s
 | Metric | Source |
 |--------|--------|
 | `wall_cluster_ms` | Wall-clock ms from container start until `cluster_size=3` |
-| `sync_elapsed_us` | Microseconds from SMD sync log: `initial SMD sync wait done - elapsed NNN us` (service-start path) or `sync wait done cl_key … elapsed NNN us` (partition-balance path) |
+| `sync_elapsed_us` | Microseconds from SMD sync log: **`initial SMD sync done - elapsed NNN us`** (INFO, secure service-start path) or **`sync wait done cl_key … elapsed NNN us`** (DETAIL `smd`, partition-balance path) |
 
 ### Timing Test Modes
 
