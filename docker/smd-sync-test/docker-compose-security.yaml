@@ -12,6 +12,10 @@ services:
       - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
@@ -30,6 +34,10 @@ services:
       - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
@@ -48,6 +56,10 @@ services:
       - ./conf-security/features.conf:/etc/aerospike/features.conf
       - ${ASD_BINARY:-../bin/asd}:/usr/bin/asd
     privileged: true
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
     command: ["asd", "--foreground", "--config-file", "/etc/aerospike/aerospike.conf"]
     healthcheck:
       test: ["CMD", "asinfo", "-Uadmin", "-Padmin", "-p", "3000", "-v", "build"]
