@@ -8,6 +8,7 @@ Local development and testing environments for Aerospike Server.
 |-----------|-------------|
 | [`docker/`](docker/) | Docker Compose cluster (1-N nodes) |
 | [`docker/smd-sync-test/`](docker/smd-sync-test/) | SMD synchronization test harness |
+| [`k8s/smd-sync-test-ako/`](k8s/smd-sync-test-ako/) | Same SMD scenarios on Kubernetes via Aerospike Kubernetes Operator |
 | [`native/`](native/) | Run asd directly on host (for IDE debugging) |
 | [`workloads/python/`](workloads/python/) | Python scripts to exercise server code paths |
 
