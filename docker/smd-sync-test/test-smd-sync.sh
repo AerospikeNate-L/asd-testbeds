@@ -566,12 +566,14 @@ timing_wait_cluster() {
 }
 
 # Extract SMD sync elapsed time from node 1 logs.
-# Checks two log lines (both emitted under "context smd debug"):
+# Primary: INFO from as_smd_wait_ready (secure clusters — no extra logging config).
+# Secondary: DETAIL from as_smd_cluster_changed_sync — requires "context smd detail"
+# (or lower) in aerospike.conf for exchange-path timing.
 #
-#   as_smd_wait_ready (INFO, fresh node/service start):
-#     "initial SMD sync wait done - elapsed NNN us"
+#   as_smd_wait_ready (INFO):
+#     "initial SMD sync done - elapsed NNN us"
 #
-#   as_smd_cluster_changed_sync (DEBUG, partition balance path):
+#   as_smd_cluster_changed_sync (DETAIL, partition balance path):
 #     "sync wait done cl_key XXXX elapsed NNN us"
 #
 # Returns the largest elapsed microsecond value found (the binding sync wait),
@@ -583,7 +585,7 @@ timing_extract_sync_us() {
     # Match both formats; pick the last (largest elapsed) value seen.
     local sync_us
     sync_us=$(echo "$logs" \
-        | grep -oP '(?:initial SMD sync wait done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
+        | grep -oP '(?:initial SMD sync done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
         | sort -n | tail -1)
 
     if [ -n "$sync_us" ]; then
