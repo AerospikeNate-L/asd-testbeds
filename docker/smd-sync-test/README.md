@@ -225,6 +225,10 @@ TIMING_REJOIN_SECURITY_ITEMS=450000 TIMING_REJOIN_STALE_PCT=95 ./test-smd-sync.s
 | `TIMING_RESULTS_DIR` | `./timing-results` | Where TSV results are written |
 | `TIMING_REJOIN_SECURITY_ITEMS` | `100000` | Security items for timing-rejoin mode |
 | `TIMING_REJOIN_STALE_PCT` | `95` | Percentage of items that are stale on rejoining node |
+| `TIMING_SANITY_SERVE_CHECK` | `true` | Before teardown: all nodes `cluster_size`, `namespaces`, `smd-info` settled |
+| `TIMING_SANITY_TIMEOUT_SEC` | `0` | Max wait for sanity (`0` = use cluster timeout for that mode) |
+
+**SERVER-209:** `timing` / `timing-rejoin` use **security-enabled** compose (`conf-security`) so **`as_smd_wait_ready`** runs before accept. They are **not** a full JTBD sign-off — see [`docs/design/SERVER-209-jtbd-checklist.md`](../../../docs/design/SERVER-209-jtbd-checklist.md). Default **`TIMING_SANITY_SERVE_CHECK`** waits for all nodes’ `smd-info` before teardown (`cluster_size=3` is insufficient). Run `./test-smd-sync.sh auth` and other functional modes for replication ordering.
 
 ### File Layout
 

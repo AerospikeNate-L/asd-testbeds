@@ -41,9 +41,20 @@ TIMING_PVC_SETTLE_SEC="${TIMING_PVC_SETTLE_SEC:-5}"
 TIMING_LOG_TAIL="${TIMING_LOG_TAIL:-0}"
 # If true, do not delete AerospikeCluster/PVCs after timing-rejoin / each timing sweep iter (inspect logs / avoid rotation losing early lines).
 TIMING_SKIP_FINAL_CLEANUP="${TIMING_SKIP_FINAL_CLEANUP:-false}"
-# After cluster_size=N, SMD may still merge heavy modules (security, …). Poll probe pod logs for
-# "{module:…} full-from-pr timing". 0 = do not wait (legacy fast scrape; under-counts large SMD).
+# Docker parity (default): after cluster_size=N, scrape principal pod logs immediately — no smd-info wait.
+# Set TIMING_WAIT_SMD_SETTLED=true to block until all pods pass smd-info (or log heuristic); timeout
+# budget is TIMING_SMD_PHASE_WAIT_SEC if >0, else TIMING_REJOIN_CLUSTER_TIMEOUT / TIMING_CLUSTER_TIMEOUT.
+TIMING_WAIT_SMD_SETTLED="${TIMING_WAIT_SMD_SETTLED:-false}"
 TIMING_SMD_PHASE_WAIT_SEC="${TIMING_SMD_PHASE_WAIT_SEC:-0}"
+# Before teardown: verify nodes can serve (see TIMING_SANITY_MODE).
+TIMING_SANITY_SERVE_CHECK="${TIMING_SANITY_SERVE_CHECK:-true}"
+TIMING_SANITY_TIMEOUT_SEC="${TIMING_SANITY_TIMEOUT_SEC:-0}"
+# cluster = cluster_size + namespaces on every pod (docker ~22s timing-rejoin parity, no smd-info wait)
+# serve  = cluster + namespaces + no sync timeout + principal smd-info settled (default SERVER-209 proxy)
+# smd-info = serve checks plus every pod smd-info settled (strict; 950k security can take many minutes)
+TIMING_SANITY_MODE="${TIMING_SANITY_MODE:-serve}"
+# How often to log per-pod smd-info + server progress lines during long waits (seconds).
+TIMING_PROGRESS_INTERVAL_SEC="${TIMING_PROGRESS_INTERVAL_SEC:-15}"
 
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-smd-sync-ako}"
 
@@ -153,11 +164,76 @@ wait_for_cluster() {
 asinfo_exec() {
   local pod=$1
   shift
+  local t="${TIMING_ASINFO_TIMEOUT_SEC:-120}"
   if [[ "${USE_AUTH:-0}" == "1" ]]; then
-    kubectl exec -n "$NS" "$pod" -c aerospike-server -- timeout 15 asinfo -Uadmin -P"$ADMIN_PASSWORD" "$@"
+    kubectl exec -n "$NS" "$pod" -c aerospike-server -- timeout "$t" asinfo -Uadmin -P"$ADMIN_PASSWORD" "$@"
   else
-    kubectl exec -n "$NS" "$pod" -c aerospike-server -- timeout 15 asinfo "$@"
+    kubectl exec -n "$NS" "$pod" -c aerospike-server -- timeout "$t" asinfo "$@"
   fi
+}
+
+# One-line smd-info summary for progress logs (cluster_key + listed modules).
+timing_smd_info_progress_line() {
+  local info=$1
+  local modules_csv=${2:-security,truncate,sindex,masking}
+  SMD_INFO="$info" MODULES_CSV="$modules_csv" python3 - <<'PY'
+import os, re
+info = os.environ.get("SMD_INFO", "")
+mods = [m.strip() for m in os.environ.get("MODULES_CSV", "").split(",") if m.strip()]
+parts = []
+m = re.search(r"cluster_key=([0-9a-fA-F]+)", info)
+if m:
+    parts.append(f"cluster_key={m.group(1)}")
+for name in mods:
+    m2 = re.search(
+        rf"(?:^|;){re.escape(name)}:committed_key=([0-9a-fA-F]+).*?n_keys=(\d+).*?state=([a-z]+)",
+        info,
+    )
+    if m2:
+        ck, nk, st = m2.group(1), m2.group(2), m2.group(3)
+        ok = "ok" if m and ck.lower() == m.group(1).lower() and st in ("pr", "npr") else "pending"
+        parts.append(f"{name}:{st} ck={ck} n={nk} {ok}")
+print(" ".join(parts) if parts else "(no smd-info)")
+PY
+}
+
+timing_should_log_progress() {
+  local elapsed=$1
+  local interval=${TIMING_PROGRESS_INTERVAL_SEC:-15}
+  [[ "$elapsed" -gt 0 && $((elapsed % interval)) -eq 0 ]]
+}
+
+# Recent server INFO/DETAIL lines for SMD merge progress (per pod).
+timing_pod_smd_log_progress_snip() {
+  local pod=$1
+  timing_kubectl_logs_probe_pod "$pod" 2>/dev/null \
+    | grep -E "initial sync progress|full-from-pr start|full-to-pr start|broadcasting full-from-pr|initial cluster sync steady|full-from-pr timing|full-to-pr timing" \
+    | tail -3
+}
+
+# All pods: smd-info module summary + last server progress lines.
+timing_log_all_pods_smd_progress_k8s() {
+  local modules_csv=${1:-security,truncate,sindex,masking}
+  local principal_pod=""
+  principal_pod=$(timing_resolve_principal_pod 2>/dev/null || true)
+  timing_log "--- SMD progress (interval=${TIMING_PROGRESS_INTERVAL_SEC}s; principal=${principal_pod:-unknown}) ---"
+  local p info snip
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    info=$(asinfo_exec "$p" -v "smd-info" 2>/dev/null || true)
+    if [[ -n "$info" ]]; then
+      timing_log "  $p smd-info: $(timing_smd_info_progress_line "$info" "$modules_csv")"
+    else
+      timing_log "  $p smd-info: (timeout — merge may block asinfo; see logs below)"
+    fi
+    snip=$(timing_pod_smd_log_progress_snip "$p")
+    if [[ -n "$snip" ]]; then
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && timing_log "    log: $line"
+      done <<< "$snip"
+    fi
+  done < <(list_pods_sorted)
+  timing_log "---"
 }
 
 collect_server_logs() {
@@ -673,48 +749,221 @@ timing_wait_cluster_ms() {
   return 0
 }
 
-# Per-pod sum of smd.c "full-from-pr timing: ... total=NNN us" (INFO). Used when
-# kubelet/log volume drops early "initial SMD sync done" lines but phase timings remain.
-# Full-from-pr INFO lines appear as each NPR module finishes merging; cluster_size=3 can precede security.
-timing_wait_module_full_from_pr_logged_k8s() {
-  local module=$1
+# Resolve log-wait budget: explicit TIMING_SMD_PHASE_WAIT_SEC, else cluster_timeout when wait_on_zero.
+timing_smd_log_wait_sec() {
+  local cluster_timeout_sec=$1
+  local wait_on_zero=${2:-0}
   local max_sec=${TIMING_SMD_PHASE_WAIT_SEC:-0}
   [[ "$max_sec" =~ ^[0-9]+$ ]] || max_sec=0
+  if [[ "$max_sec" == "0" && "$wait_on_zero" == "1" ]]; then
+    max_sec=$cluster_timeout_sec
+  fi
+  echo "$max_sec"
+}
+
+# When smd-info blocks (principal during huge full-to-pr), infer steady modules from logs:
+# each module must show {module:pr|npr:…} and not {module:dirty|merging:…} in recent output.
+timing_pod_smd_settled_from_logs_k8s() {
+  local pod=$1
+  local modules_csv=$2
+  local log module
+  log=$(timing_kubectl_logs_probe_pod "$pod" 2>/dev/null || true)
+  [[ -z "$log" ]] && return 1
+  IFS=',' read -ra modules <<< "$modules_csv"
+  for module in "${modules[@]}"; do
+    module="${module// /}"
+    [[ -z "$module" ]] && continue
+    if echo "$log" | grep -qE "\\{${module}:(dirty|merging):"; then
+      return 1
+    fi
+    if ! echo "$log" | grep -qE "\\{${module}:(pr|npr):"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Per-pod: prefer smd-info; if asinfo times out (common on principal mid-merge), use log heuristic.
+timing_pod_smd_settled_k8s() {
+  local pod=$1
+  local modules_csv=$2
+  local info
+  info=$(asinfo_exec "$pod" -v "smd-info" 2>/dev/null || true)
+  if [[ -n "$info" ]] && timing_smd_info_modules_settled "$info" "$modules_csv"; then
+    return 0
+  fi
+  if [[ -z "$info" ]] && timing_pod_smd_settled_from_logs_k8s "$pod" "$modules_csv"; then
+    return 0
+  fi
+  return 1
+}
+
+# Parse `asinfo -v smd-info` (see as_smd_get_info in smd.c). Modules are settled when each
+# in-use module has state pr|npr and committed_key == cluster_key (smd_module_is_ready).
+timing_smd_info_modules_settled() {
+  local smd_info=$1
+  local modules_csv=$2
+  SMD_INFO="$smd_info" MODULES_CSV="$modules_csv" python3 - <<'PY'
+import os, re, sys
+info = os.environ.get("SMD_INFO", "")
+mods = [m.strip() for m in os.environ.get("MODULES_CSV", "").split(",") if m.strip()]
+if not info or not mods:
+    sys.exit(1)
+m = re.search(r"cluster_key=([0-9a-fA-F]+)", info)
+if not m:
+    sys.exit(1)
+cl_key = m.group(1).lower()
+for name in mods:
+    m2 = re.search(
+        rf"(?:^|;){re.escape(name)}:committed_key=([0-9a-fA-F]+).*?state=([a-z]+)",
+        info,
+    )
+    if not m2:
+        sys.exit(1)
+    ck, st = m2.group(1).lower(), m2.group(2)
+    if ck != cl_key or st not in ("pr", "npr"):
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# Poll asinfo smd-info on every cluster pod until listed modules are settled (all nodes).
+timing_wait_smd_settled_k8s() {
+  local modules_csv=$1
+  local cluster_timeout_sec=$2
+  local wait_on_zero=${3:-0}
+  local max_sec
+  max_sec=$(timing_smd_log_wait_sec "$cluster_timeout_sec" "$wait_on_zero")
   [[ "$max_sec" == "0" ]] && return 0
 
-  local elapsed=0 probe
-  probe=$(pod_at_index 0)
-
-  timing_log "Waiting up to ${max_sec}s for {${module}:…} full-from-pr timing on $probe (merges can trail cluster_size=3)..."
+  local elapsed=0 p info settled=0
+  timing_log "Waiting up to ${max_sec}s for smd-info settled modules=[$modules_csv] on all pods (cluster_size=3 is not SMD ready)..."
 
   while [[ $elapsed -lt $max_sec ]]; do
-    if timing_kubectl_logs_probe_pod "$probe" | grep -qE "\\{${module}:[^}]*\\} full-from-pr timing"; then
-      timing_log "Observed {${module}:} full-from-pr timing after ${elapsed}s"
+    settled=1
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      if ! pod_ready "$p"; then
+        settled=0
+        break
+      fi
+      if ! timing_pod_smd_settled_k8s "$p" "$modules_csv"; then
+        settled=0
+        break
+      fi
+    done < <(list_pods_sorted)
+
+    if [[ $settled -eq 1 ]]; then
+      timing_log "All pods smd-info settled after ${elapsed}s"
       return 0
+    fi
+    if timing_should_log_progress "$elapsed"; then
+      timing_log "Still waiting for smd-info settled (${elapsed}s / ${max_sec}s)"
+      timing_log_all_pods_smd_progress_k8s "$modules_csv"
     fi
     sleep 2
     elapsed=$((elapsed + 2))
   done
 
-  timing_log "WARN: no {${module}:} full-from-pr within ${max_sec}s — sync metrics may omit slow modules"
+  timing_log "WARN: smd-info modules not settled on all pods within ${max_sec}s"
+  return 1
 }
 
-timing_fallback_full_from_pr_max_pod_us_k8s() {
-  local max=0 p log sum
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    log=$(timing_kubectl_logs_probe_pod "$p")
-    sum=$(echo "$log" | grep -oP 'full-from-pr timing:[^\n]*total=\K\d+(?= us)' | awk '{s+=$1} END {print int(s)}')
-    [[ -z "$sum" || "$sum" == "0" ]] && continue
-    if [[ "$sum" -gt "$max" ]]; then max=$sum; fi
-  done < <(list_pods_sorted)
-  echo "$max"
+# Legacy: log line on probe pod only (can miss merges on principal). Prefer timing_wait_smd_settled_k8s.
+timing_wait_module_full_from_pr_logged_k8s() {
+  local module=$1
+  local cluster_timeout_sec=$2
+  local wait_on_zero=${3:-0}
+  local max_sec
+  max_sec=$(timing_smd_log_wait_sec "$cluster_timeout_sec" "$wait_on_zero")
+  [[ "$max_sec" == "0" ]] && return 0
+
+  local elapsed=0 p
+  timing_log "Waiting up to ${max_sec}s for {${module}:…} full-from-pr timing in any pod log..."
+
+  while [[ $elapsed -lt $max_sec ]]; do
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      if timing_kubectl_logs_probe_pod "$p" | grep -qE "\\{${module}:[^}]*\\} full-from-pr timing"; then
+        timing_log "Observed {${module}:} full-from-pr timing on $p after ${elapsed}s"
+        return 0
+      fi
+    done < <(list_pods_sorted)
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  timing_log "WARN: no {${module}:} full-from-pr timing in any pod within ${max_sec}s"
 }
 
-# Prefer accept-thread lines (smd.c); else max over pods of Σ(module full-from-pr total).
+# Scrape logs for sync_elapsed_us. After asinfo shows SMD settled, timing lines may still be
+# absent (fast-path as_smd_wait_ready, no elapsed line). Use a short grace poll only.
+TIMING_LOG_SCRAPE_GRACE_SEC="${TIMING_LOG_SCRAPE_GRACE_SEC:-30}"
+# asinfo can block for minutes while principal merges huge security SMD (950k+ items).
+TIMING_ASINFO_TIMEOUT_SEC="${TIMING_ASINFO_TIMEOUT_SEC:-120}"
+
+timing_scrape_sync_elapsed_us_k8s() {
+  local grace_sec=${1:-${TIMING_LOG_SCRAPE_GRACE_SEC}}
+  local elapsed=0 sync_us=""
+
+  sync_us=$(timing_extract_sync_us_k8s)
+  if [[ -n "$sync_us" && "$sync_us" != "-1" ]]; then
+    echo "$sync_us"
+    return 0
+  fi
+
+  [[ "$grace_sec" == "0" ]] && { echo "-1"; return 0; }
+
+  timing_log "No sync_elapsed_us yet; retrying logs up to ${grace_sec}s (kubelet delay; not SMD readiness)..."
+
+  while [[ $elapsed -lt $grace_sec ]]; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+    if timing_should_log_progress "$elapsed"; then
+      timing_log_all_pods_smd_progress_k8s "truncate,sindex,security,masking"
+    fi
+    sync_us=$(timing_extract_sync_us_k8s)
+    if [[ -n "$sync_us" && "$sync_us" != "-1" ]]; then
+      timing_log "sync_elapsed_us=${sync_us} after ${elapsed}s log grace"
+      echo "$sync_us"
+      return 0
+    fi
+  done
+
+  timing_log "WARN: no sync_elapsed_us in logs after ${grace_sec}s grace (SMD may still be ready per smd-info)"
+  echo "-1"
+}
+
+# AKO single-rack timing cluster: principal is highest ordinal (rejoin) — resolve after pods exist.
+timing_resolve_principal_pod() {
+  local p="" elapsed=0
+  while [[ $elapsed -lt 120 ]]; do
+    p=$(list_pods_sorted | tail -n1)
+    [[ -n "$p" ]] && { echo "$p"; return 0; }
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  timing_log "WARN: could not resolve principal pod (no pods matching $LABEL_SELECTOR)"
+  return 1
+}
+
+timing_principal_pod() {
+  timing_resolve_principal_pod || true
+}
+
+timing_fallback_full_from_pr_sum_us_k8s() {
+  local pod=${1:-$(timing_principal_pod)}
+  local log sum
+  log=$(timing_kubectl_logs_probe_pod "$pod")
+  sum=$(echo "$log" | grep -oP 'full-from-pr timing:[^\n]*total=\K\d+(?= us)' | awk '{s+=$1} END {print int(s)}')
+  echo "${sum:-0}"
+}
+
+# Parity with docker timing_extract_sync_us: principal pod logs only (aerospike-1 in compose).
 timing_extract_sync_us_k8s() {
-  local logs primary fallback
-  logs=$(timing_collect_server_logs)
+  local pod logs primary fallback
+  pod=$(timing_principal_pod)
+  logs=$(timing_kubectl_logs_probe_pod "$pod")
   primary=$(echo "$logs" \
     | grep -oP '(?:initial SMD sync(?: wait)? done - elapsed |sync wait done cl_key [0-9a-fA-F]+ elapsed )\K\d+(?= us)' \
     | sort -n | tail -1 || true)
@@ -722,13 +971,155 @@ timing_extract_sync_us_k8s() {
     echo "$primary"
     return 0
   fi
-  fallback=$(timing_fallback_full_from_pr_max_pod_us_k8s)
+  fallback=$(timing_fallback_full_from_pr_sum_us_k8s "$pod")
   if [[ -n "$fallback" && "$fallback" != "0" ]]; then
-    timing_log "sync_elapsed_us fallback: max-pod Σ(full-from-pr total)=${fallback} us (no initial/sync-wait elapsed line in scrape — often kubelet log rotation / volume)"
+    timing_log "sync_elapsed_us fallback: Σ(full-from-pr total) on principal $pod=${fallback} us (no initial/sync-wait line in scrape)"
     echo "$fallback"
     return 0
   fi
   echo "-1"
+}
+
+timing_maybe_wait_smd_settled_k8s() {
+  local modules_csv=$1
+  local cluster_timeout_sec=$2
+  [[ "${TIMING_WAIT_SMD_SETTLED}" == "true" || "${TIMING_WAIT_SMD_SETTLED}" == "1" ]] || return 0
+  timing_wait_smd_settled_k8s "$modules_csv" "$cluster_timeout_sec" 1 || true
+}
+
+timing_sanity_fail_detail_k8s() {
+  local pod=$1
+  local modules_csv=$2
+  local info
+  info=$(asinfo_exec "$pod" -v "smd-info" 2>/dev/null || true)
+  if [[ -n "$info" ]]; then
+    timing_log "  $pod smd-info: $(timing_smd_info_progress_line "$info" "$modules_csv")"
+  else
+    timing_log "  $pod smd-info: (timeout or empty — often principal during huge security merge)"
+  fi
+}
+
+# Pre-teardown SERVER-209 proxy (see TIMING_SANITY_MODE).
+timing_sanity_serve_ready_k8s() {
+  local expected_size=$1
+  local modules_csv=$2
+  local cluster_timeout_sec=$3
+
+  [[ "${TIMING_SANITY_SERVE_CHECK}" == "false" || "${TIMING_SANITY_SERVE_CHECK}" == "0" ]] && return 0
+
+  local mode="${TIMING_SANITY_MODE:-serve}"
+  local max_sec=${TIMING_SANITY_TIMEOUT_SEC:-0}
+  [[ "$max_sec" == "0" ]] && max_sec=$cluster_timeout_sec
+
+  case "$mode" in
+    cluster)
+      timing_log "Sanity (mode=cluster): all ${expected_size} pod(s) — cluster_size + namespaces (docker fast-path parity)..."
+      ;;
+    smd-info|strict|all)
+      timing_log "Sanity (mode=smd-info): all ${expected_size} pod(s) — cluster_size, namespaces, smd-info [${modules_csv}] (timeout ${max_sec}s)..."
+      ;;
+    *)
+      timing_log "Sanity (mode=serve): all ${expected_size} pod(s) — cluster_size + namespaces; principal smd-info [${modules_csv}] (timeout ${max_sec}s)..."
+      ;;
+  esac
+
+  local elapsed=0 principal_pod=""
+  while [[ $elapsed -lt $max_sec ]]; do
+    mapfile -t pods < <(list_pods_sorted)
+    if [[ ${#pods[@]} -lt $expected_size ]]; then
+      sleep 2
+      elapsed=$((elapsed + 2))
+      continue
+    fi
+
+    principal_pod=$(timing_resolve_principal_pod || true)
+
+    local all_ok=1 fail_reason=""
+    for p in "${pods[@]}"; do
+      [[ -z "$p" ]] && continue
+      if ! pod_ready "$p"; then
+        all_ok=0
+        fail_reason="$p not Ready"
+        break
+      fi
+      local size
+      size=$(asinfo_exec "$p" -v "statistics" 2>/dev/null | grep -oP 'cluster_size=\K\d+' | head -1 || echo 0)
+      if [[ "$size" != "$expected_size" ]]; then
+        all_ok=0
+        fail_reason="$p cluster_size=$size (want $expected_size)"
+        break
+      fi
+      if ! asinfo_exec "$p" -v "namespaces" 2>/dev/null | grep -q "test"; then
+        all_ok=0
+        fail_reason="$p asinfo namespaces missing test ns"
+        break
+      fi
+      if timing_kubectl_logs_probe_pod "$p" | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+        all_ok=0
+        fail_reason="$p SMD sync timed out in logs"
+        break
+      fi
+      case "$mode" in
+        smd-info|strict|all)
+          if ! timing_pod_smd_settled_k8s "$p" "$modules_csv"; then
+            all_ok=0
+            fail_reason="$p smd-info not settled (e.g. security committed_key != cluster_key while NPR merges)"
+            break
+          fi
+          ;;
+        serve)
+          [[ -n "$principal_pod" && "$p" == "$principal_pod" ]] || continue
+          if ! timing_pod_smd_settled_k8s "$p" "$modules_csv"; then
+            all_ok=0
+            fail_reason="$p smd-info not settled (principal)"
+            break
+          fi
+          ;;
+      esac
+    done
+
+    if [[ $all_ok -eq 1 ]]; then
+      timing_log "Sanity PASS (${mode}): ready (${elapsed}s; principal=${principal_pod:-n/a})"
+      return 0
+    fi
+
+    if timing_should_log_progress "$elapsed"; then
+      timing_log "Sanity still waiting (${elapsed}s / ${max_sec}s): ${fail_reason:-unknown}"
+      timing_log_all_pods_smd_progress_k8s "$modules_csv"
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  timing_log "Sanity FAIL (${mode}) within ${max_sec}s (last: ${fail_reason:-unknown})"
+  timing_log "Hint: NPR pods keep security committed_key=0 while full-from-pr runs — use TIMING_SANITY_MODE=cluster for docker scrape parity, or smd-info to wait on every pod"
+  return 1
+}
+
+timing_log_wire_size_estimates() {
+  local smd_dir=$1
+  timing_log "Per-module wire size estimates (128MB limit per module):"
+  python3 << EOF
+import json, os
+smd_dir = '${smd_dir}'
+for f in sorted(os.listdir(smd_dir)):
+    if not f.endswith('.smd'):
+        continue
+    path = os.path.join(smd_dir, f)
+    try:
+        data = json.load(open(path))
+        items = data[1:]
+        n = len(items)
+        if n == 0:
+            continue
+        total_key = sum(len(item['key']) for item in items)
+        total_val = sum(len(item.get('value', '') or '') for item in items)
+        wire = total_key + total_val + n * (4 + 8 + 4)
+        pct = wire * 100 / (128 * 1024 * 1024)
+        print(f"  {f}: {n} items, {wire/1024/1024:.1f}MB wire ({pct:.0f}% of limit)")
+    except Exception as e:
+        print(f"  {f}: error - {e}")
+EOF
 }
 
 timing_write_sync_breakdown_log() {
@@ -737,7 +1128,7 @@ timing_write_sync_breakdown_log() {
   timing_log "SMD sync breakdown -> $out"
   {
     echo "### $(date -Is) cluster=${CLUSTER} ns=${NS}"
-    timing_collect_server_logs | grep -E 'initial SMD sync|sync wait (start|done)|full-from-pr timing|full-to-pr timing|\{security:'
+    timing_collect_server_logs | grep -E 'initial SMD sync|initial sync done|initial cluster sync steady|sync wait (start|done)|full-from-pr timing|full-to-pr timing|\{security:' || true
   } >> "$out"
 }
 
@@ -825,12 +1216,17 @@ timing_run_one_k8s() {
   local wall_ms
   wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_CLUSTER_TIMEOUT")
 
+  local sync_us="-1"
   if [[ "$wall_ms" != "-1" ]]; then
-    timing_wait_module_full_from_pr_logged_k8s "$TIMING_MODULE"
+    timing_maybe_wait_smd_settled_k8s "$TIMING_MODULE" "$TIMING_CLUSTER_TIMEOUT"
+    sync_us=$(timing_scrape_sync_elapsed_us_k8s)
   fi
 
-  local sync_us
-  sync_us=$(timing_extract_sync_us_k8s)
+  local sanity_rc=0
+  if [[ "$wall_ms" != "-1" ]]; then
+    timing_sanity_serve_ready_k8s 3 "$TIMING_MODULE" "$TIMING_CLUSTER_TIMEOUT" || sanity_rc=1
+  fi
+
   timing_write_sync_breakdown_log "$results_file"
 
   if [[ "$wall_ms" == "-1" ]]; then
@@ -844,24 +1240,31 @@ timing_run_one_k8s() {
     sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
   fi
 
+  local principal_pod=""
+  principal_pod=$(timing_resolve_principal_pod || true)
+
   local timed_out=0
-  if timing_collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+  if [[ -n "$principal_pod" ]] && timing_kubectl_logs_probe_pod "$principal_pod" | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
     timed_out=1
-    timing_log "WARNING: SMD sync timed out (see pod logs)"
+    timing_log "WARNING: SMD sync timed out (principal pod logs)"
   fi
 
   local smd_mb
   smd_mb=$(python3 -c "import os; print(f'{os.path.getsize(\"${SMD_DATA_DIR}/node1/smd/${TIMING_MODULE}.smd\") / 1048576:.2f}')")
 
-  timing_log "RESULT: items=$n_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out}"
+  timing_log "RESULT: items=$n_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out} sanity=$([[ $sanity_rc -eq 0 ]] && echo PASS || echo FAIL)"
 
   echo -e "${n_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
 
+  timing_log "Phase timing from principal (${principal_pod:-unknown}):"
+  timing_kubectl_logs_probe_pod "$principal_pod" | grep -E "full-to-pr timing|full-from-pr timing" \
+    | while read -r line; do timing_log "  $line"; done || true
+
   local phase_log="${results_file%.tsv}-phases.log"
-  timing_log "Phase timing -> $phase_log"
-  timing_collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" | sed "s/^/[n=${n_items}] /" >> "$phase_log"
+  timing_collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" | sed "s/^/[n=${n_items}] /" >> "$phase_log" || true
 
   timing_maybe_cleanup
+  [[ $sanity_rc -ne 0 ]] && return 1
 }
 
 test_large_smd_timing_k8s() {
@@ -876,6 +1279,8 @@ test_large_smd_timing_k8s() {
   }
 
   timing_log "=== SMD large-payload timing sweep (AKO / preprovisioned PVCs) ==="
+  [[ -n "${ASD_BINARY:-}" ]] && timing_log "ASD_BINARY: $ASD_BINARY"
+  timing_log "Harness: cluster wait then principal-pod log scrape (docker timing parity; TIMING_WAIT_SMD_SETTLED=false by default)"
   timing_log "Docker helpers: $DOCKER_SMD_TEST"
   timing_log "Sweep items=${TIMING_ITEMS} value_size=${TIMING_VALUE_SIZE}B"
   timing_log "Cluster manifest: $TIMING_AC_MANIFEST (initMethod: none preserves seeded SMD)"
@@ -918,35 +1323,7 @@ timing_rejoin_run_k8s() {
   seed_workdir_smd_from_host 1 "${SMD_DATA_DIR}/node2/smd"
   seed_workdir_smd_from_host 2 "${SMD_DATA_DIR}/node3/smd"
 
-  kubectl apply -f "$TIMING_AC_MANIFEST"
-
-  local wall_ms
-  wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_REJOIN_CLUSTER_TIMEOUT")
-
-  if [[ "$wall_ms" != "-1" ]]; then
-    timing_wait_module_full_from_pr_logged_k8s "security"
-  fi
-
-  local sync_us
-  sync_us=$(timing_extract_sync_us_k8s)
-  timing_write_sync_breakdown_log "$results_file"
-
-  if [[ "$wall_ms" == "-1" ]]; then
-    timing_log "FAIL: cluster did not form (timing-rejoin)"
-    timing_maybe_cleanup
-    return 1
-  fi
-
-  local sync_ms="n/a"
-  if [[ "$sync_us" != "-1" ]]; then
-    sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
-  fi
-
-  local timed_out=0
-  if timing_collect_server_logs | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
-    timed_out=1
-    timing_log "WARNING: SMD sync timed out"
-  fi
+  timing_log_wire_size_estimates "${SMD_DATA_DIR}/node1/smd"
 
   local current_items stale_items smd_mb
   current_items=$(python3 -c "
@@ -975,15 +1352,70 @@ for n in (1, 2, 3):
 print(f'{total / 1048576:.2f}')
 ")
 
-  timing_log "RESULT: stale_pct=$TIMING_REJOIN_STALE_PCT current=$current_items stale=$stale_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out}"
+  timing_log "Starting 3-node cluster (rejoin scenario)..."
+  timing_log "  Nodes 1,2 (ord 0,1): $current_items items (current)"
+  timing_log "  Node 3 (ord 2):       $stale_items items (stale, ${TIMING_REJOIN_STALE_PCT}% of current)"
+  timing_log "  Missing on node 3:    $((current_items - stale_items)) items"
+  [[ "${TIMING_WAIT_SMD_SETTLED}" == "true" || "${TIMING_WAIT_SMD_SETTLED}" == "1" ]] \
+    && timing_log "TIMING_WAIT_SMD_SETTLED=true — will wait for smd-info on all pods after cluster forms"
+  [[ "${TIMING_SANITY_SERVE_CHECK}" == "false" || "${TIMING_SANITY_SERVE_CHECK}" == "0" ]] \
+    || timing_log "TIMING_SANITY_SERVE_CHECK=true — will verify all pods serve asinfo + smd-info before teardown"
+
+  kubectl apply -f "$TIMING_AC_MANIFEST"
+
+  local wall_ms
+  wall_ms=$(timing_wait_cluster_ms 3 "$TIMING_REJOIN_CLUSTER_TIMEOUT")
+
+  if [[ "$wall_ms" == "-1" ]]; then
+    timing_log "FAIL: cluster did not form (timing-rejoin)"
+    timing_maybe_cleanup
+    return 1
+  fi
+
+  timing_maybe_wait_smd_settled_k8s "truncate,sindex,security,masking" "$TIMING_REJOIN_CLUSTER_TIMEOUT"
+
+  timing_log_all_pods_smd_progress_k8s "truncate,sindex,security,masking"
+
+  local sync_us
+  sync_us=$(timing_scrape_sync_elapsed_us_k8s)
+
+  local sanity_rc=0
+  timing_sanity_serve_ready_k8s 3 "truncate,sindex,security,masking" "$TIMING_REJOIN_CLUSTER_TIMEOUT" || sanity_rc=1
+
+  local principal_pod=""
+  principal_pod=$(timing_resolve_principal_pod || true)
+  timing_log "Principal pod (docker aerospike-1 parity): ${principal_pod:-unknown}"
+
+  local sync_ms="n/a"
+  if [[ "$sync_us" != "-1" ]]; then
+    sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
+  fi
+
+  local timed_out=0
+  if [[ -n "$principal_pod" ]] && timing_kubectl_logs_probe_pod "$principal_pod" | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+    timed_out=1
+    timing_log "WARNING: SMD sync timed out (principal pod logs)"
+  fi
+
+  timing_write_sync_breakdown_log "$results_file"
+
+  timing_log "RESULT: stale_pct=$TIMING_REJOIN_STALE_PCT current=$current_items stale=$stale_items smd=${smd_mb}MB wall=${wall_ms}ms smd_sync=${sync_ms} ms (${sync_us} us) timeout=${timed_out} sanity=$([[ $sanity_rc -eq 0 ]] && echo PASS || echo FAIL)"
+  timing_log "Principal logs: kubectl logs -n $NS $principal_pod -c aerospike-server"
 
   echo -e "${TIMING_REJOIN_STALE_PCT}\t${current_items}\t${stale_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${timed_out}" >> "$results_file"
 
+  timing_log "Phase timing from principal (${principal_pod:-unknown}):"
+  if [[ -n "$principal_pod" ]]; then
+    timing_kubectl_logs_probe_pod "$principal_pod" | grep -E "full-to-pr timing|full-from-pr timing" \
+      | while read -r line; do timing_log "  $line"; done || true
+  fi
+
   local phase_log="${results_file%.tsv}-phases.log"
   timing_collect_server_logs | grep -E "full-to-pr timing|full-from-pr timing" \
-    | sed "s/^/[rejoin:${TIMING_REJOIN_STALE_PCT}%] /" >> "$phase_log"
+    | sed "s/^/[rejoin:${TIMING_REJOIN_STALE_PCT}%] /" >> "$phase_log" || true
 
   timing_maybe_cleanup
+  [[ $sanity_rc -ne 0 ]] && return 1
 }
 
 test_rejoin_smd_timing_k8s() {
@@ -998,7 +1430,9 @@ test_rejoin_smd_timing_k8s() {
   }
 
   timing_log "=== Rejoin SMD timing (AKO) ==="
+  [[ -n "${ASD_BINARY:-}" ]] && timing_log "ASD_BINARY: $ASD_BINARY"
   timing_log "Stale %: $TIMING_REJOIN_STALE_PCT  security items: $TIMING_REJOIN_SECURITY_ITEMS"
+  timing_log "Harness: cluster wait then principal-pod log scrape (docker timing-rejoin parity; TIMING_WAIT_SMD_SETTLED=false by default)"
   if [[ -z "${TIMING_LOG_TAIL}" || "${TIMING_LOG_TAIL}" == "0" ]]; then
     timing_log "Log scan: full aerospike-server logs (TIMING_LOG_TAIL=0) for sync/phase lines"
   else

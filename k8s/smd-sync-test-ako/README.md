@@ -11,16 +11,54 @@ Kubernetes + [AKO](https://docs.aerospike.com/cloud/kubernetes/operator) variant
 
 ## Timing parity (`timing`, `timing-rejoin`)
 
-Large-SMD timing mirrors [`docker/smd-sync-test/test-smd-sync.sh`](../../docker/smd-sync-test/test-smd-sync.sh) **`timing`** and **`timing-rejoin`** modes:
+Large-SMD timing mirrors [`docker/smd-sync-test/test-smd-sync.sh`](../../docker/smd-sync-test/test-smd-sync.sh) **`timing`** and **`timing-rejoin`** modes.
 
-- **Same generators** on the host: [`docker/smd-sync-test/gen-large-smd.py`](../../docker/smd-sync-test/gen-large-smd.py) and [`docker/smd-sync-test/gen-realistic-smd.py`](../../docker/smd-sync-test/gen-realistic-smd.py) (requires **`python3`** on the machine running the harness).
-- **Pre-provisioned PVCs** — [`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml) creates `workdir-<cluster>-0-{0,1,2}` claims before the `AerospikeCluster` exists so the StatefulSet adopts them (same naming pattern AKO uses).
-- **Seeding** — short-lived `busybox` pods mount each PVC at `/opt/aerospike`, reset `smd/`, and `kubectl cp` generated `.smd` files from the host staging dir (`SMD_DATA_DIR`, default `/tmp/smd-timing-k8s-data`).
-- **`initMethod: none`** — [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml) matches the normal cluster spec but sets `filesystemVolumePolicy.initMethod: none` so **`aerospike-init` does not delete pre-seeded files** on the workdir volume (the default bed uses `deleteFiles`, which would wipe staged SMD).
+### Shared (apples-to-apples)
 
-**Not ported** (still Docker-only in this repo): `timing-real`, `timing-conflict`, `show-limits` — same rationale as before (extra scenarios; add similarly if needed).
+| Item | Docker | K8s (this harness) |
+|------|--------|-------------------|
+| Generators | `gen-large-smd.py`, `gen-realistic-smd.py` | Same scripts under `docker/smd-sync-test/` |
+| Rejoin dataset | node1/2 current, node3 stale % | ord 0/1 ← node1, ord 2 ← node3 stale |
+| `TIMING_REJOIN_*` env | same names | same names |
+| Logging | `context smd detail` in conf | `smd: detail` in AerospikeCluster YAML |
+| **After `cluster_size=3`** | scrape **`aerospike-1`** logs immediately | scrape **principal pod** logs (`smdsync-0-2` on 3-node rack) |
+| `sync_elapsed_us` | principal logs; `-1` if no elapsed line | same parse on principal pod |
+| Wire size estimate | printed before cluster up | printed before cluster up |
+| Phase TSV column | `wall_cluster_ms`, `sync_elapsed_us`, … | same |
 
-**Interpretation:** Wall-clock and `initial SMD sync wait done - elapsed … us` / `sync wait done …` lines match the Docker script’s parsing. Total time includes Kubernetes-specific costs (CSI attach, init containers, scheduling); compare runs on the same cluster image/config when benchmarking.
+Default **`TIMING_WAIT_SMD_SETTLED=false`** on K8s (Docker has no smd-info wait). Set **`TIMING_WAIT_SMD_SETTLED=true`** only when you explicitly want all pods’ `asinfo smd-info` settled before scrape.
+
+### SERVER-209 (what timing does / does not cover)
+
+| Check | `./test-smd-sync-k8s.sh all` | `timing` / `timing-rejoin` |
+|-------|------------------------------|----------------------------|
+| SMD sync ordering, rejoin, auth replication | yes | partial (large payload / perf) |
+| **`as_smd_wait_ready` / listen gate** | `auth` test (security CR) | timing cluster is **non-secure** — does not exercise secure defer-accept |
+| **`AS_ERR_UNAVAILABLE` until init balance** | not automated | not automated |
+| **All nodes SMD settled before teardown** | smd-info in functional tests | **`TIMING_SANITY_SERVE_CHECK=true`** (default): every pod `cluster_size`, `namespaces`, `smd-info` settled |
+
+`cluster_size=3` alone is **not** full SMD quiescence (950k security still merges on NPRs for minutes). Docker **~22s** runs match **`TIMING_SANITY_MODE=cluster`** (default was briefly all-pod `smd-info`, which blocks on `smdsync-0-0` with `security:committed_key=0`). Cross-check:
+
+```bash
+# Same slow all-pod smd-info wait on Docker:
+TIMING_SANITY_MODE=smd-info TIMING_REJOIN_SECURITY_ITEMS=950000 ... ./test-smd-sync.sh timing-rejoin
+
+# Docker fast-path parity:
+TIMING_SANITY_MODE=cluster ...
+```
+
+For full JTBD coverage see [`docs/design/SERVER-209-jtbd-checklist.md`](../../../docs/design/SERVER-209-jtbd-checklist.md) — use **`all`** plus timing with sanity for scale.
+
+### K8s-only (expect extra wall time vs Docker)
+
+- Pre-provisioned PVCs + seed pods + `kubectl cp` ([`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml))
+- **`initMethod: none`** on workdir ([`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml))
+- Host staging: `SMD_DATA_DIR` default `/tmp/smd-timing-k8s-data` (Docker: `/tmp/smd-timing-data`)
+- Image embeds `asd` (rebuild + `kind load` after each binary change)
+
+**Not ported:** `timing-real`, `timing-conflict`, `show-limits` (Docker-only for now).
+
+**Interpretation:** Compare **`wall_cluster_ms`** and the same `TIMING_REJOIN_*` on the **same `ASD_BINARY`**. End-to-end script time on K8s includes seed/CSI; Docker ~20s for 950k/99% is normal while K8s was inflated by optional smd-info waits — now off by default.
 
 After the usual prerequisites (kind, operator, server image, secrets):
 
@@ -36,19 +74,28 @@ TIMING_ITEMS='10000 50000' TIMING_VALUE_SIZE=200 ./test-smd-sync-k8s.sh timing
 TIMING_REJOIN_STALE_PCT=80 TIMING_REJOIN_SECURITY_ITEMS=100000 ./test-smd-sync-k8s.sh timing-rejoin
 ```
 
-Extreme **timing-rejoin** (large security LDAP-style payload + very stale rejoining node) — raise cluster wait and use **full logs** so `sync_elapsed_us` is not truncated (`TIMING_LOG_TAIL=0` is the default for timing modes):
+Extreme **timing-rejoin** (same env as Docker; optional inspect pods afterward):
 
 ```bash
+export ASD_BINARY=/path/to/target/Linux-x86_64/bin/asd
+./scripts/build-load-server-image.sh
+
 TIMING_REJOIN_SECURITY_ITEMS=950000 TIMING_REJOIN_STALE_PCT=99 \
-TIMING_REJOIN_CLUSTER_TIMEOUT=7200 TIMEOUT=7200 TIMING_LOG_TAIL=0 \
-TIMING_SMD_PHASE_WAIT_SEC=7200 \
+TIMING_REJOIN_CLUSTER_TIMEOUT=600 \
+TIMING_LOG_TAIL=0 \
 TIMING_SKIP_FINAL_CLEANUP=true \
 ./test-smd-sync-k8s.sh timing-rejoin
 ```
 
-`TIMING_SMD_PHASE_WAIT_SEC` — after `cluster_size=3`, heavy modules (e.g. **security**) may still be merging; the harness waits for `{security:…} full-from-pr timing` in the probe pod’s log before computing **`sync_elapsed_us`** (default **`0`** = legacy immediate scrape, often **missing security**). **`TIMING_SKIP_FINAL_CLEANUP=true`** keeps pods/PVCs up for manual `kubectl logs` and reports.
+Optional — wait until **all pods** report smd-info settled (not Docker parity; can take hours on huge security):
 
-Each run also appends **`*-sync-breakdown.log`** next to the TSV (filtered SMD timing lines). **`sync_elapsed_us`** prefers **`initial SMD sync done` / `sync wait done`** lines; if those are gone from the kubelet buffer, it falls back to **max over pods of Σ(`full-from-pr` `total=` μs)**.
+```bash
+TIMING_WAIT_SMD_SETTLED=true TIMING_SMD_PHASE_WAIT_SEC=7200 \
+TIMING_REJOIN_CLUSTER_TIMEOUT=7200 \
+./test-smd-sync-k8s.sh timing-rejoin
+```
+
+Each run appends **`*-sync-breakdown.log`** (all pods) and **`*-phases.log`**. **`sync_elapsed_us`** is from **principal pod** logs only (like Docker `aerospike-1`).
 
 Confirm **workdir volume size** in [`manifests/pvc-workdir-preprovision.yaml`](manifests/pvc-workdir-preprovision.yaml) and [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml) is enough for generated `.smd` (default **3Gi** may be tight at ~950k security rows).
 
@@ -201,9 +248,16 @@ From this directory (`asd-testbeds/k8s/smd-sync-test-ako/`):
 | `TIMING_PVC_SETTLE_SEC` | `5` | Brief sleep after PVC objects exist (`WaitForFirstConsumer` binds per seed pod, not all upfront) |
 | `TIMING_LOG_TAIL` | `0` | `timing` / `timing-rejoin` log scrape: **`0` = full container log** (no `--tail`); else `--tail=N` lines |
 | `TIMING_SKIP_FINAL_CLEANUP` | `false` | If **`true`**, do not delete CR/PVCs after a timing iteration (inspect logs; run `cleanup-full` later) |
-| `TIMING_SMD_PHASE_WAIT_SEC` | `0` | Seconds to poll for `{security:…}` / `{TIMING_MODULE:…}` **`full-from-pr`** line after cluster forms (**`0`** = no wait). Use **7200+** for huge timing-rejoin |
+| `TIMING_WAIT_SMD_SETTLED` | `false` | If **`true`**, after `cluster_size=3` wait for **`asinfo smd-info`** settled on **all** pods (Docker has no equivalent; can take hours on huge security) |
+| `TIMING_SMD_PHASE_WAIT_SEC` | `0` | When **`TIMING_WAIT_SMD_SETTLED=true`**: max seconds for smd-info wait if **>0**; else uses **`TIMING_REJOIN_CLUSTER_TIMEOUT`** / **`TIMING_CLUSTER_TIMEOUT`** |
+| `TIMING_LOG_SCRAPE_GRACE_SEC` | `30` | After cluster ready (and optional smd-info wait), retry principal-pod log scrape for `sync_elapsed_us` |
+| `TIMING_PROGRESS_INTERVAL_SEC` | `15` | During sanity / smd-info wait / log grace: log all pods' `smd-info` + server `initial sync progress` lines |
+| `TIMING_ASINFO_TIMEOUT_SEC` | `120` | Per-call timeout for `asinfo` during smd-info polling |
+| `TIMING_SANITY_SERVE_CHECK` | `true` | Pre-teardown serve check (disable for scrape-only) |
+| `TIMING_SANITY_MODE` | `serve` | **`cluster`** = docker ~22s parity (`cluster_size` + `namespaces` only). **`serve`** = that + principal `smd-info` settled. **`smd-info`** = every pod settled (950k security can take many minutes on NPRs) |
+| `TIMING_SANITY_TIMEOUT_SEC` | `0` | Max wait for sanity (`0` = use `TIMING_*_CLUSTER_TIMEOUT`) |
 
-Sync timing (`sync_elapsed_us`) prefers **`initial SMD sync done`** / **`sync wait done`** (`smd.c`); if absent from the scrape, uses **max over pods of Σ(`full-from-pr` `total=` μs)**. **`smd: debug`** on console is required for **`sync wait done`** — see [`manifests/aerospikecluster-timing.yaml`](manifests/aerospikecluster-timing.yaml).
+Sync timing (`sync_elapsed_us`) matches Docker: scrape **principal pod** logs (`smdsync-0-2` ≈ compose **`aerospike-1`**) right after **`cluster_size=3`**, with a short log grace retry. Parses **`initial SMD sync done - elapsed`** (INFO) / **`sync wait done … elapsed`** (DETAIL) / fallback **Σ `full-from-pr timing` `total=`** on principal only. **`-1`** is normal when the fast path omits elapsed lines. Set **`TIMING_WAIT_SMD_SETTLED=true`** only when you need all pods’ smd-info settled before scrape.
 
 ## Cleanup
 

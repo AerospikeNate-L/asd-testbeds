@@ -465,6 +465,13 @@ test_identical_smd() {
 
 TIMING_PROJECT="smd-timing"
 TIMING_COMPOSE="docker-compose-timing.yaml"
+# Before teardown: verify nodes can serve (see TIMING_SANITY_MODE).
+TIMING_SANITY_SERVE_CHECK="${TIMING_SANITY_SERVE_CHECK:-true}"
+TIMING_SANITY_TIMEOUT_SEC="${TIMING_SANITY_TIMEOUT_SEC:-0}"
+TIMING_ASINFO_TIMEOUT_SEC="${TIMING_ASINFO_TIMEOUT_SEC:-120}"
+# cluster | serve (default) | smd-info — same semantics as k8s harness
+TIMING_SANITY_MODE="${TIMING_SANITY_MODE:-serve}"
+TIMING_PROGRESS_INTERVAL_SEC="${TIMING_PROGRESS_INTERVAL_SEC:-15}"
 MIXED_FAIL_OPEN_OLD_IMAGE_COMPOSE="docker-compose-mixed-old-image.yaml"
 SMD_DATA_DIR="${SMD_DATA_DIR:-/tmp/smd-timing-data}"
 TIMING_MODULE="evict"          # evict module: no key format validation, clean logs
@@ -548,6 +555,16 @@ timing_wait_cluster() {
                | grep -oP 'cluster_size=\K\d+' || \
                timeout 5 docker exec smd-timing-aerospike-1 asinfo -v "statistics" 2>/dev/null \
                | grep -oP 'cluster_size=\K\d+' || echo "0")
+        if timing_should_log_progress "$elapsed" 2>/dev/null; then
+            timing_log "  cluster wait (${elapsed}s): node1 cluster_size=${size} (want ${expected_size})" >&2
+            local n snip
+            for n in 1 2 3; do
+                snip=$(docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-"$n" 2>&1 \
+                    | grep -E "initial sync progress|sync wait done|service ready|waiting for initial" \
+                    | tail -2)
+                [ -n "$snip" ] && timing_log "    node${n}: $(echo "$snip" | tr '\n' ' ')" >&2
+            done
+        fi
         if [ "$size" = "$expected_size" ]; then
             local t_end
             t_end=$(date +%s%N)
@@ -604,6 +621,250 @@ timing_extract_sync_us() {
     echo "-1"
 }
 
+timing_docker_asinfo() {
+    local node=$1
+    shift
+    local t="${TIMING_ASINFO_TIMEOUT_SEC:-120}"
+    timeout 5 docker exec smd-timing-aerospike-"$node" asinfo -Uadmin -Padmin "$@" 2>/dev/null || \
+        timeout 5 docker exec smd-timing-aerospike-"$node" asinfo "$@" 2>/dev/null
+}
+
+timing_docker_asinfo_long() {
+    local node=$1
+    shift
+    local t="${TIMING_ASINFO_TIMEOUT_SEC:-120}"
+    timeout "$t" docker exec smd-timing-aerospike-"$node" asinfo -Uadmin -Padmin "$@" 2>/dev/null || \
+        timeout "$t" docker exec smd-timing-aerospike-"$node" asinfo "$@" 2>/dev/null
+}
+
+# Same parser as k8s harness (timing_smd_info_modules_settled).
+timing_smd_info_modules_settled() {
+    local smd_info=$1
+    local modules_csv=$2
+    SMD_INFO="$smd_info" MODULES_CSV="$modules_csv" python3 - <<'PY'
+import os, re, sys
+info = os.environ.get("SMD_INFO", "")
+mods = [m.strip() for m in os.environ.get("MODULES_CSV", "").split(",") if m.strip()]
+if not info or not mods:
+    sys.exit(1)
+m = re.search(r"cluster_key=([0-9a-fA-F]+)", info)
+if not m:
+    sys.exit(1)
+cl_key = m.group(1).lower()
+for name in mods:
+    m2 = re.search(
+        rf"(?:^|;){re.escape(name)}:committed_key=([0-9a-fA-F]+).*?state=([a-z]+)",
+        info,
+    )
+    if not m2:
+        sys.exit(1)
+    ck, st = m2.group(1).lower(), m2.group(2)
+    if ck != cl_key or st not in ("pr", "npr"):
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+timing_docker_node_smd_settled_from_logs() {
+    local node=$1
+    local modules_csv=$2
+    local log module
+    log=$(docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-"$node" 2>&1 || true)
+    [ -z "$log" ] && return 1
+    IFS=',' read -ra modules <<< "$modules_csv"
+    for module in "${modules[@]}"; do
+        module="${module// /}"
+        [ -z "$module" ] && continue
+        if echo "$log" | grep -qE "\\{${module}:(dirty|merging):"; then
+            return 1
+        fi
+        if ! echo "$log" | grep -qE "\\{${module}:(pr|npr):"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+timing_docker_node_smd_settled() {
+    local node=$1
+    local modules_csv=$2
+    local info
+    info=$(timing_docker_asinfo_long "$node" -v "smd-info" || true)
+    if [ -n "$info" ] && timing_smd_info_modules_settled "$info" "$modules_csv"; then
+        return 0
+    fi
+    if [ -z "$info" ] && timing_docker_node_smd_settled_from_logs "$node" "$modules_csv"; then
+        return 0
+    fi
+    return 1
+}
+
+timing_docker_principal_node() {
+    # Rejoin timing: highest node-id (a3) is principal — aerospike-3.
+    echo 3
+}
+
+timing_smd_info_progress_line() {
+    local info=$1
+    local modules_csv=${2:-security,truncate,sindex,masking}
+    SMD_INFO="$info" MODULES_CSV="$modules_csv" python3 - <<'PY'
+import os, re
+info = os.environ.get("SMD_INFO", "")
+mods = [m.strip() for m in os.environ.get("MODULES_CSV", "").split(",") if m.strip()]
+parts = []
+m = re.search(r"cluster_key=([0-9a-fA-F]+)", info)
+if m:
+    parts.append(f"cluster_key={m.group(1)}")
+for name in mods:
+    m2 = re.search(
+        rf"(?:^|;){re.escape(name)}:committed_key=([0-9a-fA-F]+).*?n_keys=(\d+).*?state=([a-z]+)",
+        info,
+    )
+    if m2:
+        ck, nk, st = m2.group(1), m2.group(2), m2.group(3)
+        ok = "ok" if m and ck.lower() == m.group(1).lower() and st in ("pr", "npr") else "pending"
+        parts.append(f"{name}:{st} ck={ck} n={nk} {ok}")
+print(" ".join(parts) if parts else "(no smd-info)")
+PY
+}
+
+timing_should_log_progress() {
+    local elapsed=$1
+    local interval=${TIMING_PROGRESS_INTERVAL_SEC:-15}
+    [ "$elapsed" -gt 0 ] && [ $((elapsed % interval)) -eq 0 ]
+}
+
+timing_docker_node_smd_log_progress_snip() {
+    local node=$1
+    docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-"$node" 2>&1 \
+        | grep -E "initial sync progress|full-from-pr start|full-to-pr start|broadcasting full-from-pr|initial cluster sync steady|full-from-pr timing|full-to-pr timing" \
+        | tail -5
+}
+
+timing_log_all_nodes_smd_progress_docker() {
+    local modules_csv=${1:-security,truncate,sindex,masking}
+    local principal
+    principal=$(timing_docker_principal_node)
+    timing_log "--- SMD progress (interval=${TIMING_PROGRESS_INTERVAL_SEC}s; principal=node${principal}) ---"
+    local node info snip line
+    for node in 1 2 3; do
+        info=$(timing_docker_asinfo_long "$node" -v "smd-info" || true)
+        if [ -n "$info" ]; then
+            timing_log "  node${node} smd-info: $(timing_smd_info_progress_line "$info" "$modules_csv")"
+        else
+            timing_log "  node${node} smd-info: (timeout — merge may block asinfo; see logs below)"
+        fi
+        snip=$(timing_docker_node_smd_log_progress_snip "$node")
+        if [ -n "$snip" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && timing_log "    log: $line"
+            done <<< "$snip"
+        fi
+    done
+    timing_log "---"
+}
+
+timing_sanity_fail_detail_docker() {
+    local node=$1
+    local info
+    info=$(timing_docker_asinfo_long "$node" -v "smd-info" || true)
+    if [ -n "$info" ]; then
+        timing_log "  node${node} smd-info: $(echo "$info" | tr ';' '\n' | grep -E '^smd:|^security:' | head -2 | tr '\n' ' ')"
+    else
+        timing_log "  node${node} smd-info: (timeout — principal often blocks during huge security merge)"
+    fi
+}
+
+# Pre-teardown SERVER-209 proxy (see TIMING_SANITY_MODE).
+timing_sanity_serve_ready_docker() {
+    local expected_size=$1
+    local modules_csv=$2
+    local cluster_timeout_sec=$3
+
+    case "${TIMING_SANITY_SERVE_CHECK}" in
+        false|0|no) return 0 ;;
+    esac
+
+    local mode="${TIMING_SANITY_MODE:-serve}"
+    local max_sec=${TIMING_SANITY_TIMEOUT_SEC:-0}
+    [ "$max_sec" = "0" ] && max_sec=$cluster_timeout_sec
+
+    case "$mode" in
+        cluster)
+            timing_log "Sanity (mode=cluster): all ${expected_size} node(s) — cluster_size + namespaces (fast-path parity)..."
+            ;;
+        smd-info|strict|all)
+            timing_log "Sanity (mode=smd-info): all ${expected_size} node(s) — cluster_size, namespaces, smd-info [${modules_csv}] (timeout ${max_sec}s)..."
+            ;;
+        *)
+            timing_log "Sanity (mode=serve): all ${expected_size} node(s) — cluster_size + namespaces; principal smd-info [${modules_csv}] (timeout ${max_sec}s)..."
+            ;;
+    esac
+
+    local elapsed=0
+    local principal_node
+    principal_node=$(timing_docker_principal_node)
+
+    while [ $elapsed -lt $max_sec ]; do
+        local all_ok=1
+        local fail_reason=""
+        local node
+        for node in 1 2 3; do
+            local size
+            size=$(timing_docker_asinfo "$node" -v "statistics" | grep -oP 'cluster_size=\K\d+' | head -1 || echo 0)
+            if [ "$size" != "$expected_size" ]; then
+                all_ok=0
+                fail_reason="node${node} cluster_size=$size (want $expected_size)"
+                break
+            fi
+            if ! timing_docker_asinfo "$node" -v "namespaces" | grep -q "test"; then
+                all_ok=0
+                fail_reason="node${node} asinfo namespaces missing test ns"
+                break
+            fi
+            if docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs aerospike-"$node" 2>&1 \
+                    | grep -qE "SMD sync timed out|initial SMD sync timed out"; then
+                all_ok=0
+                fail_reason="node${node} SMD sync timed out in logs"
+                break
+            fi
+            case "$mode" in
+                smd-info|strict|all)
+                    if ! timing_docker_node_smd_settled "$node" "$modules_csv"; then
+                        all_ok=0
+                        fail_reason="node${node} smd-info not settled"
+                        break
+                    fi
+                    ;;
+                serve)
+                    [ "$node" = "$principal_node" ] || continue
+                    if ! timing_docker_node_smd_settled "$node" "$modules_csv"; then
+                        all_ok=0
+                        fail_reason="node${node} smd-info not settled (principal)"
+                        break
+                    fi
+                    ;;
+            esac
+        done
+
+        if [ $all_ok -eq 1 ]; then
+            timing_log "Sanity PASS (${mode}): ready (${elapsed}s; principal=node${principal_node})"
+            return 0
+        fi
+
+        if timing_should_log_progress "$elapsed"; then
+            timing_log "Sanity still waiting (${elapsed}s / ${max_sec}s): ${fail_reason:-unknown}"
+            timing_log_all_nodes_smd_progress_docker "$modules_csv"
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    timing_log "Sanity FAIL (${mode}) within ${max_sec}s (last: ${fail_reason:-unknown})"
+    timing_log "Hint: use TIMING_SANITY_MODE=cluster for scrape-only parity; smd-info waits on every NPR (950k security is slow)"
+    return 1
+}
+
 # Run a single timing measurement for a given item count.
 # Appends one TSV data row to the provided results file.
 timing_run_one() {
@@ -634,6 +895,9 @@ timing_run_one() {
         return 1
     fi
 
+    local sanity_rc=0
+    timing_sanity_serve_ready_docker 3 "$TIMING_MODULE" 300 || sanity_rc=1
+
     local sync_ms="n/a"
     if [ "$sync_us" != "-1" ]; then
         sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
@@ -647,7 +911,7 @@ timing_run_one() {
         timing_log "WARNING: SMD sync timed out on node 1!"
     fi
 
-    timing_log "RESULT: items=$n_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+    timing_log "RESULT: items=$n_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}  sanity=$([ $sanity_rc -eq 0 ] && echo PASS || echo FAIL)"
 
     echo -e "${n_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${TIMING_VALUE_SIZE}\t${timed_out}" >> "$results_file"
 
@@ -659,6 +923,7 @@ timing_run_one() {
         | sed "s/^/[n=${n_items}] /" >> "$phase_log"
 
     timing_teardown
+    [ $sanity_rc -ne 0 ] && return 1
 }
 
 test_large_smd_timing() {
@@ -1555,6 +1820,9 @@ EOF
         return 1
     fi
 
+    local sanity_rc=0
+    timing_sanity_serve_ready_docker 3 "truncate,sindex,security,masking" 600 || sanity_rc=1
+
     local sync_ms="n/a"
     if [ "$sync_us" != "-1" ]; then
         sync_ms=$(python3 -c "print(f'{int(\"$sync_us\") / 1000:.1f}')")
@@ -1568,7 +1836,7 @@ EOF
         timing_log "WARNING: SMD sync timed out on node 1!"
     fi
 
-    timing_log "RESULT: stale_pct=$stale_pct  current=$current_items  stale=$stale_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}"
+    timing_log "RESULT: stale_pct=$stale_pct  current=$current_items  stale=$stale_items  smd=${smd_mb}MB  wall=${wall_ms}ms  smd_sync=${sync_ms}ms (${sync_us}us)  timeout=${timed_out}  sanity=$([ $sanity_rc -eq 0 ] && echo PASS || echo FAIL)"
     timing_log "Server logs: ${SMD_DATA_DIR}/node{1,2,3}/log/aerospike.log"
 
     echo -e "${stale_pct}\t${current_items}\t${stale_items}\t${smd_mb}\t${wall_ms}\t${sync_us}\t${timed_out}" >> "$results_file"
@@ -1585,6 +1853,7 @@ EOF
         | sed "s/^/[rejoin:${stale_pct}%] /" >> "$phase_log"
 
     timing_teardown
+    [ $sanity_rc -ne 0 ] && return 1
 }
 
 test_rejoin_smd_timing() {

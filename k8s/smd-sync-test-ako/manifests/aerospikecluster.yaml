@@ -40,7 +40,7 @@ spec:
     logging:
       - name: console
         any: info
-        smd: debug
+        smd: detail
         exchange: debug
     network:
       service:
