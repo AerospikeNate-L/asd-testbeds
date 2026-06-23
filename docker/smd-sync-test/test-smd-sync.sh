@@ -496,6 +496,8 @@ MIXED_FAIL_OPEN_OLD_NODE="${MIXED_FAIL_OPEN_OLD_NODE:-3}"
 MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS="${MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS:-5000}"
 MIXED_FAIL_OPEN_WAIT_SECONDS="${MIXED_FAIL_OPEN_WAIT_SECONDS:-45}"
 MIXED_FAIL_OPEN_OLD_IMAGE="${MIXED_FAIL_OPEN_OLD_IMAGE:-}"
+MIXED_DIRTY_REJOIN_WAIT_SECONDS="${MIXED_DIRTY_REJOIN_WAIT_SECONDS:-60}"
+MIXED_DIRTY_REJOIN_INDEX="${MIXED_DIRTY_REJOIN_INDEX:-mixed_dirty_current}"
 
 # Ensure results dir exists
 TIMING_RESULTS_DIR="${TIMING_RESULTS_DIR:-./timing-results}"
@@ -923,7 +925,7 @@ timing_run_one() {
         | sed "s/^/[n=${n_items}] /" >> "$phase_log"
 
     timing_teardown
-    [ $sanity_rc -ne 0 ] && return 1
+    return $sanity_rc
 }
 
 test_large_smd_timing() {
@@ -1376,6 +1378,118 @@ test_mixed_fail_open() {
 
     timing_log "Containers left running for inspection. Check logs with: docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs"
     return 1
+}
+
+mixed_dirty_rejoin_set_binaries() {
+    # Nodes 2 and 3 are old-version nodes; node 3 is the deterministic principal.
+    ASD_BINARY_NODE1="$ASD_BINARY"
+    ASD_BINARY_NODE2="$OLD_ASD_BINARY"
+    ASD_BINARY_NODE3="$OLD_ASD_BINARY"
+
+    export ASD_BINARY_NODE1 ASD_BINARY_NODE2 ASD_BINARY_NODE3
+}
+
+mixed_dirty_rejoin_seed_smd() {
+    mixed_fail_open_prepare_dirs
+
+    timing_log "Seeding mixed dirty rejoin SMD:"
+    timing_log "  Nodes 2,3: current sindex data, cv_tid=2"
+    timing_log "  Node 1:   stale new-version NPR data, cv_tid=1"
+
+    python3 << EOF
+import json
+import os
+
+base_dir = "${SMD_DATA_DIR}"
+cv_key = 0x1111
+
+current = [
+    [cv_key, 2],
+    {
+        "key": "test|demo|dirty0|.|S",
+        "value": "mixed_dirty_stale",
+        "generation": 1,
+        "timestamp": 1700000000000,
+    },
+    {
+        "key": "test|demo|dirty1|.|S",
+        "value": "${MIXED_DIRTY_REJOIN_INDEX}",
+        "generation": 1,
+        "timestamp": 1700000000001,
+    },
+]
+
+stale = [
+    [cv_key, 1],
+    {
+        "key": "test|demo|dirty0|.|S",
+        "value": "mixed_dirty_stale",
+        "generation": 1,
+        "timestamp": 1699999999999,
+    },
+]
+
+for node, data in ((1, stale), (2, current), (3, current)):
+    path = os.path.join(base_dir, f"node{node}", "smd", "sindex.smd")
+    with open(path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+EOF
+}
+
+mixed_dirty_rejoin_poll_first_sindex() {
+    local elapsed=0
+
+    timing_log "Polling first successful sindex response from new-version node 1..."
+
+    while [ $elapsed -lt "$MIXED_DIRTY_REJOIN_WAIT_SECONDS" ]; do
+        local output
+
+        if output=$(timing_docker_asinfo 1 -v "sindex" 2>&1); then
+            if echo "$output" | grep -q "$MIXED_DIRTY_REJOIN_INDEX"; then
+                timing_log "PASS: first successful response includes $MIXED_DIRTY_REJOIN_INDEX"
+                return 0
+            fi
+
+            timing_log "FAIL: first successful response from node 1 is missing $MIXED_DIRTY_REJOIN_INDEX"
+            timing_log "Response: $output"
+            return 1
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    timing_log "FAIL: node 1 did not accept an sindex query within ${MIXED_DIRTY_REJOIN_WAIT_SECONDS}s"
+    return 1
+}
+
+test_mixed_dirty_rejoin() {
+    mixed_fail_open_validate_binaries || return 1
+
+    if [ -n "$MIXED_FAIL_OPEN_OLD_IMAGE" ]; then
+        timing_log "ERROR: mixed-dirty-rejoin requires OLD_ASD_BINARY to run in the timing image for old node 2."
+        timing_log "Unset MIXED_FAIL_OPEN_OLD_IMAGE or add a compose override for old node 2."
+        return 1
+    fi
+
+    timing_log "=== Mixed-Version Dirty NPR Rejoin Regression ==="
+    timing_log "New ASD_BINARY: $ASD_BINARY"
+    timing_log "Old OLD_ASD_BINARY: $OLD_ASD_BINARY"
+    timing_log "Required index: $MIXED_DIRTY_REJOIN_INDEX"
+
+    timing_teardown
+    mixed_dirty_rejoin_seed_smd
+    mixed_dirty_rejoin_set_binaries
+
+    export SMD_DATA_DIR
+    docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" up -d 2>&1 | tail -5 || true
+
+    mixed_dirty_rejoin_poll_first_sindex || {
+        timing_log "Containers left running for inspection. Check logs with: docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs"
+        return 1
+    }
+
+    timing_teardown
 }
 
 # Run realistic timing test
@@ -1853,7 +1967,7 @@ EOF
         | sed "s/^/[rejoin:${stale_pct}%] /" >> "$phase_log"
 
     timing_teardown
-    [ $sanity_rc -ne 0 ] && return 1
+    return $sanity_rc
 }
 
 test_rejoin_smd_timing() {
@@ -1957,6 +2071,9 @@ case "${1:-all}" in
     mixed-fail-open)
         test_mixed_fail_open
         ;;
+    mixed-dirty-rejoin)
+        test_mixed_dirty_rejoin
+        ;;
     all)
         failed=0
         test_basic_sync_ordering || failed=1
@@ -2004,7 +2121,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|full-ack-order|mixed-fail-open|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2015,6 +2132,7 @@ case "${1:-all}" in
         echo "  identical   - Test nodes joining with identical pre-existing SMD"
         echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
+        echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
         echo "  all         - Run all correctness tests"
         echo ""
         echo "Timing tests:"
