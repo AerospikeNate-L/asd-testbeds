@@ -80,6 +80,29 @@ wait_for_cluster() {
     return 1
 }
 
+wait_for_sync_wait_size() {
+    local expected_size=$1
+    local timeout=$2
+    local elapsed_tenths=0
+    local max_tenths=$((timeout * 10))
+
+    log "Waiting for SMD sync wait with cluster size $expected_size (timeout: ${timeout}s)..."
+
+    while [ $elapsed_tenths -lt $max_tenths ]; do
+        if docker compose -p $COMPOSE_PROJECT logs aerospike-1 aerospike-2 2>&1 \
+                | grep -q "sync wait start cl_key .* size $expected_size"; then
+            log "Observed SMD sync wait with cluster size $expected_size"
+            return 0
+        fi
+
+        sleep 0.1
+        elapsed_tenths=$((elapsed_tenths + 1))
+    done
+
+    log "ERROR: Did not observe SMD sync wait with cluster size $expected_size"
+    return 1
+}
+
 test_basic_sync_ordering() {
     log "=== Test 1: Basic SMD Sync Ordering ==="
     
@@ -444,6 +467,44 @@ test_identical_smd() {
 
     log "PASS: Cluster started successfully with identical SMD"
     log "Test 6 complete"
+}
+
+test_principal_loss_initial_sync() {
+    log "=== Test 7: Principal Loss During Initial SMD Sync ==="
+
+    local sindex_count="${PRINCIPAL_LOSS_SINDEX_COUNT:-128}"
+
+    docker compose -p $COMPOSE_PROJECT down -v 2>/dev/null || true
+
+    log "Starting node 1 alone to seed SMD data..."
+    start_nodes 1
+    wait_for_cluster 1 $TIMEOUT
+
+    log "Creating $sindex_count secondary indexes to keep initial SMD sync observable..."
+    for i in $(seq 1 "$sindex_count"); do
+        docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo \
+            -v "sindex-create:ns=test;set=demo;indexname=principal_loss_${i};bin=pl_${i};type=string" \
+            >/dev/null 2>&1 || true
+    done
+    sleep 2
+
+    log "Starting nodes 2 and 3, then stopping principal node 3 during size-3 SMD wait..."
+    start_nodes 2 3
+    wait_for_sync_wait_size 3 30
+    stop_nodes 3
+
+    log "Waiting for surviving nodes to process principal loss and form size 2..."
+    wait_for_cluster 2 $TIMEOUT
+
+    logs=$(docker compose -p $COMPOSE_PROJECT logs aerospike-1 aerospike-2 2>&1)
+    if echo "$logs" | grep -q "sync wait aborted cl_key\|sync wait superseded cl_key"; then
+        log "PASS: Initial SMD sync wait was abandoned after principal loss"
+    else
+        log "FAIL: No aborted/superseded SMD sync wait found after principal loss"
+        return 1
+    fi
+
+    log "Test 7 complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -1492,6 +1553,114 @@ test_mixed_dirty_rejoin() {
     timing_teardown
 }
 
+# Test that an authoritative FULL_FROM_PR with zero items (principal DB empty,
+# but newer cv_tid) correctly clears stale local items on NPR nodes.
+#
+# Without the fix the NPR sees n_incoming==0 && n_existing!=0 and takes the
+# cv_key-only fast path, leaving stale items intact. With the fix it checks
+# op->tid == old_cv_tid: when the tids differ the full-replace path runs and
+# the local DB is cleared.
+test_empty_authoritative_full() {
+    if [ -z "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
+        return 1
+    fi
+    if [ ! -f "$ASD_BINARY" ]; then
+        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
+        return 1
+    fi
+
+    timing_log "=== Authoritative Empty FULL_FROM_PR Regression ==="
+    timing_log "ASD_BINARY: $ASD_BINARY"
+    timing_log "Setup: node 1 (principal) empty sindex cv_tid=2; nodes 2,3 (NPRs) stale sindex cv_tid=1"
+
+    timing_teardown
+    mixed_fail_open_prepare_dirs
+
+    python3 << EOF
+import json, os
+
+base_dir = "${SMD_DATA_DIR}"
+cv_key   = 0x3333
+
+# Principal (node 1): empty sindex, newer cv_tid
+principal = [[cv_key, 2]]
+
+# NPRs (nodes 2,3): stale sindex item, older cv_tid
+stale = [
+    [cv_key, 1],
+    {
+        "key":        "test|demo|empty_auth_stale_idx|.|S",
+        "value":      "empty_auth_stale_val",
+        "generation": 1,
+        "timestamp":  1700000000000,
+    },
+]
+
+for node, data in ((1, principal), (2, stale), (3, stale)):
+    path = os.path.join(base_dir, f"node{node}", "smd", "sindex.smd")
+    with open(path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+EOF
+
+    ASD_BINARY_NODE1="$ASD_BINARY"
+    ASD_BINARY_NODE2="$ASD_BINARY"
+    ASD_BINARY_NODE3="$ASD_BINARY"
+    export ASD_BINARY_NODE1 ASD_BINARY_NODE2 ASD_BINARY_NODE3 SMD_DATA_DIR
+
+    docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 60)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: cluster did not form"
+        docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs 2>&1 | tail -20
+        timing_teardown
+        return 1
+    fi
+
+    local failed=0
+
+    # Read the smd file from inside the container (the bind-mounted file is
+    # owned by root inside the container). Grep for the stale key directly:
+    # - Bug present: cv_key-only path kept the stale item → key in file.
+    # - Fix applied: full-replace path cleared the DB → key not in file.
+    for node in 2 3; do
+        local content
+        content=$(docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" exec -T \
+            aerospike-"$node" cat /opt/aerospike/smd/sindex.smd 2>/dev/null || true)
+
+        if [ -z "$content" ]; then
+            timing_log "WARN: node $node smd file unreadable; skipping"
+            continue
+        fi
+
+        if echo "$content" | grep -q "empty_auth_stale_idx"; then
+            timing_log "FAIL: node $node sindex.smd still has stale key — cv_key-only path incorrectly kept stale DB"
+            failed=1
+        else
+            timing_log "PASS: node $node sindex.smd has no stale key after sync"
+        fi
+    done
+
+    if docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs 2>&1 \
+            | grep -q "SMD sync timed out\|initial SMD sync timed out"; then
+        timing_log "FAIL: SMD sync timed out"
+        failed=1
+    fi
+
+    timing_teardown
+
+    if [ $failed -eq 0 ]; then
+        timing_log "PASS: authoritative empty FULL_FROM_PR correctly replaced stale NPR items"
+        return 0
+    else
+        timing_log "FAIL: empty-authoritative-full test failed — containers left for inspection"
+        return 1
+    fi
+}
+
 # Run realistic timing test
 timing_real_run() {
     local modules="$1"
@@ -2065,6 +2234,9 @@ case "${1:-all}" in
     identical)
         test_identical_smd
         ;;
+    principal-loss)
+        test_principal_loss_initial_sync
+        ;;
     full-ack-order)
         test_full_ack_ordering
         ;;
@@ -2074,6 +2246,9 @@ case "${1:-all}" in
     mixed-dirty-rejoin)
         test_mixed_dirty_rejoin
         ;;
+    empty-authoritative-full)
+        test_empty_authoritative_full
+        ;;
     all)
         failed=0
         test_basic_sync_ordering || failed=1
@@ -2082,6 +2257,7 @@ case "${1:-all}" in
         test_preexisting_smd || failed=1
         test_principal_pulls_from_npr || failed=1
         test_identical_smd || failed=1
+        test_principal_loss_initial_sync || failed=1
         
         if [ $failed -eq 0 ]; then
             log "=== All tests PASSED ==="
@@ -2121,7 +2297,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2130,10 +2306,12 @@ case "${1:-all}" in
         echo "  preexisting - Test first node with SMD, others join empty"
         echo "  pull        - Test new node joins cluster with existing SMD"
         echo "  identical   - Test nodes joining with identical pre-existing SMD"
+        echo "  principal-loss - Test initial SMD sync wait aborts after principal loss"
         echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
-        echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
-        echo "  all         - Run all correctness tests"
+  echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
+  echo "  empty-authoritative-full - Test authoritative empty FULL_FROM_PR clears stale NPR items (SERVER-209)"
+  echo "  all         - Run all correctness tests"
         echo ""
         echo "Timing tests:"
         echo "  timing      - Sweep large SMD payloads (synthetic, unrealistic keys)"
