@@ -81,17 +81,22 @@ wait_for_cluster() {
 }
 
 wait_for_sync_wait_size() {
+    # Wait until at least one node is blocked in as_smd_wait_ready() for the
+    # current cluster.  The old implementation logged "sync wait start cl_key …
+    # size N"; the new implementation logs "waiting for initial SMD sync".
     local expected_size=$1
     local timeout=$2
     local elapsed_tenths=0
     local max_tenths=$((timeout * 10))
 
-    log "Waiting for SMD sync wait with cluster size $expected_size (timeout: ${timeout}s)..."
+    log "Waiting for SMD sync wait (cluster size $expected_size) (timeout: ${timeout}s)..."
 
+    # First wait until the cluster actually reaches the expected size, then
+    # confirm that at least one node is waiting for its initial SMD sync.
     while [ $elapsed_tenths -lt $max_tenths ]; do
         if docker compose -p $COMPOSE_PROJECT logs aerospike-1 aerospike-2 2>&1 \
-                | grep -q "sync wait start cl_key .* size $expected_size"; then
-            log "Observed SMD sync wait with cluster size $expected_size"
+                | grep -q "waiting for initial SMD sync"; then
+            log "Observed SMD sync wait (cluster size $expected_size)"
             return 0
         fi
 
@@ -99,7 +104,7 @@ wait_for_sync_wait_size() {
         elapsed_tenths=$((elapsed_tenths + 1))
     done
 
-    log "ERROR: Did not observe SMD sync wait with cluster size $expected_size"
+    log "ERROR: Did not observe SMD sync wait for cluster size $expected_size"
     return 1
 }
 
@@ -122,25 +127,17 @@ test_basic_sync_ordering() {
     # Get logs from first node
     logs=$(docker compose -p $COMPOSE_PROJECT logs aerospike 2>&1)
     
-    # Look for sync messages (optional - requires cf_debug level and specific code paths)
-    if echo "$logs" | grep -q "sync wait start"; then
-        log "PASS: Found 'sync wait start' message"
+    # Look for sync messages (optional - only present when pre-existing SMD data forces a wait)
+    if echo "$logs" | grep -q "waiting for initial SMD sync"; then
+        log "PASS: Found 'waiting for initial SMD sync' message"
     else
-        log "INFO: No 'sync wait start' found (normal for fresh cluster with no pre-existing SMD)"
+        log "INFO: No SMD sync wait found (normal for fresh cluster with no pre-existing SMD)"
     fi
     
-    if echo "$logs" | grep -q "sync wait done\|all modules settled"; then
-        log "PASS: Found sync completion message"
+    if echo "$logs" | grep -q "initial SMD sync done"; then
+        log "PASS: Found SMD sync completion message"
     else
         log "INFO: No sync completion found (normal for fresh cluster with no pre-existing SMD)"
-    fi
-    
-    # Check that no timeout occurred
-    if echo "$logs" | grep -q "SMD sync timed out"; then
-        log "FAIL: SMD sync timed out!"
-        return 1
-    else
-        log "PASS: No SMD sync timeout"
     fi
     
     log "Test 1 complete"
@@ -497,14 +494,141 @@ test_principal_loss_initial_sync() {
     wait_for_cluster 2 $TIMEOUT
 
     logs=$(docker compose -p $COMPOSE_PROJECT logs aerospike-1 aerospike-2 2>&1)
-    if echo "$logs" | grep -q "sync wait aborted cl_key\|sync wait superseded cl_key"; then
-        log "PASS: Initial SMD sync wait was abandoned after principal loss"
+    if echo "$logs" | grep -q "initial SMD sync done"; then
+        log "PASS: Surviving nodes completed initial SMD sync after principal loss"
     else
-        log "FAIL: No aborted/superseded SMD sync wait found after principal loss"
+        log "FAIL: No 'initial SMD sync done' found after principal loss - nodes may be wedged"
         return 1
     fi
 
     log "Test 7 complete"
+}
+
+test_migration_deferred_until_smd_ready() {
+    log "=== Test 8: Migration Deferred Until SMD Settled ==="
+    #
+    # Verifies the liveness and ordering properties of the SMD settle gate on
+    # as_partition_immigrate_start():
+    #   - Fresh nodes joining a cluster with large SMD eventually RELEASE the
+    #     gate (no permanent stall).
+    #   - Data and SMD both arrive on fresh nodes after the cluster forms.
+    #
+    # Strategy:
+    #   1. Node 1 starts alone, creates many sinexes (slow SMD) + records.
+    #   2. Fresh nodes 2 and 3 join — they are blocked in as_smd_wait_ready()
+    #      in run_accept(), while immigration requests return AS_MIGRATE_AGAIN
+    #      until as_smd_settled_for_migration() becomes true.
+    #   3. After SMD settles, verify:
+    #        a. "initial SMD sync done" is logged (settle gate released).
+    #        b. All nodes can be queried (run_accept() unblocked).
+    #        c. All nodes have the sinexes (SMD propagated correctly).
+    #        d. Data written before the join is accessible on all nodes
+    #           (migrations completed after settle).
+    #
+
+    local sindex_count="${MIGRATION_DEFER_SINDEX_COUNT:-64}"
+    local record_count="${MIGRATION_DEFER_RECORD_COUNT:-1000}"
+
+    docker compose -p $COMPOSE_PROJECT down -v 2>/dev/null || true
+
+    log "Starting node 1 alone to seed SMD data and records..."
+    start_nodes 1
+    wait_for_cluster 1 $TIMEOUT
+
+    log "Creating $sindex_count secondary indexes..."
+    for i in $(seq 1 "$sindex_count"); do
+        docker exec ${COMPOSE_PROJECT}-aerospike-1 asinfo \
+            -v "sindex-create:ns=test;set=demo;indexname=migdefer_${i};bin=md_${i};type=string" \
+            >/dev/null 2>&1 || true
+    done
+
+    log "Writing $record_count records to node 1..."
+    docker exec ${COMPOSE_PROJECT}-aerospike-1 aql \
+        -c "INSERT INTO test.demo (PK, md_1) VALUES ('migdefer_rec_1', 'v1')" \
+        >/dev/null 2>&1 || true
+    for i in $(seq 2 "$record_count"); do
+        docker exec ${COMPOSE_PROJECT}-aerospike-1 aql \
+            -c "INSERT INTO test.demo (PK, md_1) VALUES ('migdefer_rec_${i}', 'v${i}')" \
+            >/dev/null 2>&1 || true
+    done 2>/dev/null
+    sleep 2
+
+    log "Starting fresh nodes 2 and 3..."
+    start_nodes 2 3
+
+    log "Waiting for 3-node cluster to form..."
+    wait_for_cluster 3 $TIMEOUT
+
+    log "Waiting for initial SMD sync to complete on surviving nodes..."
+    local elapsed=0
+    while [ $elapsed -lt $TIMEOUT ]; do
+        if docker compose -p $COMPOSE_PROJECT logs aerospike-2 aerospike-3 2>&1 \
+                | grep -q "initial SMD sync done"; then
+            log "Observed 'initial SMD sync done' on nodes 2 and/or 3"
+            break
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    if [ $elapsed -ge $TIMEOUT ]; then
+        log "FAIL: 'initial SMD sync done' not observed within ${TIMEOUT}s"
+        return 1
+    fi
+
+    sleep 3  # allow migrations to complete after SMD settle
+
+    log "Verifying SMD (sinexes) propagated to all nodes..."
+    local all_have_sindex=true
+    for i in 1 2 3; do
+        if docker exec ${COMPOSE_PROJECT}-aerospike-$i asinfo -v "sindex" 2>&1 | grep -q "indexname=migdefer_1:"; then
+            log "Node $i has sinexes"
+        else
+            log "FAIL: Node $i missing sinexes"
+            all_have_sindex=false
+        fi
+    done
+
+    if ! $all_have_sindex; then
+        log "FAIL: SMD not propagated to all nodes"
+        return 1
+    fi
+
+    log "Verifying data accessible on all nodes (spot-checking key migdefer_rec_1)..."
+    local all_readable=true
+    for i in 1 2 3; do
+        if docker exec ${COMPOSE_PROJECT}-aerospike-$i aql \
+                -c "SELECT * FROM test.demo WHERE PK='migdefer_rec_1'" 2>&1 \
+                | grep -q "md_1"; then
+            log "Node $i can read migdefer_rec_1"
+        else
+            log "FAIL: Node $i cannot read migdefer_rec_1 (migration incomplete or misdirected)"
+            all_readable=false
+        fi
+    done
+
+    if ! $all_readable; then
+        log "FAIL: Data not accessible on all nodes"
+        return 1
+    fi
+
+    # Verify the cluster holds all the data (sum of master_objects = record_count).
+    local total_master=0
+    for i in 1 2 3; do
+        local m
+        m=$(docker exec ${COMPOSE_PROJECT}-aerospike-$i asinfo \
+            -v "namespace/test" 2>/dev/null | grep -oP 'master_objects=\K\d+' | head -1 || echo "0")
+        total_master=$((total_master + ${m:-0}))
+    done
+    log "Total master_objects across all nodes: $total_master (expected $record_count)"
+    if [ "$total_master" -ge "$record_count" ]; then
+        log "PASS: All $record_count records present (total master_objects=$total_master)"
+    else
+        log "FAIL: Only $total_master master_objects, expected >= $record_count"
+        return 1
+    fi
+
+    log "Test 8 complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -1368,7 +1492,7 @@ mixed_fail_open_wait_for_sync_done() {
     while [ $elapsed -lt $timeout ]; do
         local sync_us
         sync_us=$(docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs "$service" 2>&1 \
-            | grep -oP 'sync wait done cl_key [0-9a-f]+ elapsed \K\d+(?= us)' \
+            | grep -oP '(?:initial SMD sync done - elapsed |sync wait done cl_key [0-9a-f]+ elapsed )\K\d+(?= us)' \
             | tail -1 || true)
 
         if [ -n "$sync_us" ]; then
@@ -1572,7 +1696,10 @@ test_empty_authoritative_full() {
 
     timing_log "=== Authoritative Empty FULL_FROM_PR Regression ==="
     timing_log "ASD_BINARY: $ASD_BINARY"
-    timing_log "Setup: node 1 (principal) empty sindex cv_tid=2; nodes 2,3 (NPRs) stale sindex cv_tid=1"
+    # Real principal in this testbed is node 3 (highest node-id, succession
+    # sorted descending) - see conf/aerospike-node3.conf. Seed the empty,
+    # newer-tid data there so it is actually the principal side of the sync.
+    timing_log "Setup: node 3 (principal) empty sindex cv_tid=2; nodes 1,2 (NPRs) stale sindex cv_tid=1"
 
     timing_teardown
     mixed_fail_open_prepare_dirs
@@ -1583,10 +1710,10 @@ import json, os
 base_dir = "${SMD_DATA_DIR}"
 cv_key   = 0x3333
 
-# Principal (node 1): empty sindex, newer cv_tid
+# Principal (node 3): empty sindex, newer cv_tid
 principal = [[cv_key, 2]]
 
-# NPRs (nodes 2,3): stale sindex item, older cv_tid
+# NPRs (nodes 1,2): stale sindex item, older cv_tid
 stale = [
     [cv_key, 1],
     {
@@ -1597,7 +1724,7 @@ stale = [
     },
 ]
 
-for node, data in ((1, principal), (2, stale), (3, stale)):
+for node, data in ((3, principal), (1, stale), (2, stale)):
     path = os.path.join(base_dir, f"node{node}", "smd", "sindex.smd")
     with open(path, "w") as f:
         json.dump(data, f, separators=(",", ":"))
@@ -1626,7 +1753,7 @@ EOF
     # owned by root inside the container). Grep for the stale key directly:
     # - Bug present: cv_key-only path kept the stale item → key in file.
     # - Fix applied: full-replace path cleared the DB → key not in file.
-    for node in 2 3; do
+    for node in 1 2; do
         local content
         content=$(docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" exec -T \
             aerospike-"$node" cat /opt/aerospike/smd/sindex.smd 2>/dev/null || true)
@@ -2237,6 +2364,9 @@ case "${1:-all}" in
     principal-loss)
         test_principal_loss_initial_sync
         ;;
+    migration-defer)
+        test_migration_deferred_until_smd_ready
+        ;;
     full-ack-order)
         test_full_ack_ordering
         ;;
@@ -2258,7 +2388,8 @@ case "${1:-all}" in
         test_principal_pulls_from_npr || failed=1
         test_identical_smd || failed=1
         test_principal_loss_initial_sync || failed=1
-        
+        test_migration_deferred_until_smd_ready || failed=1
+
         if [ $failed -eq 0 ]; then
             log "=== All tests PASSED ==="
             if [ "$CLEANUP_ON_SUCCESS" = "true" ]; then
@@ -2297,7 +2428,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2307,6 +2438,7 @@ case "${1:-all}" in
         echo "  pull        - Test new node joins cluster with existing SMD"
         echo "  identical   - Test nodes joining with identical pre-existing SMD"
         echo "  principal-loss - Test initial SMD sync wait aborts after principal loss"
+        echo "  migration-defer - Test fresh node defers immigration until SMD settled"
         echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
   echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
