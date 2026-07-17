@@ -1518,15 +1518,18 @@ mixed_fail_open_wait_for_sync_done() {
 test_mixed_fail_open() {
     mixed_fail_open_validate_binaries || return 1
 
+    MIXED_FAIL_OPEN_INDEX="${MIXED_FAIL_OPEN_INDEX:-idx_mixed_fail_open}"
+
     timing_log "=== Mixed-Version SMD Fail-Open Regression ==="
     timing_log "New ASD_BINARY: $ASD_BINARY"
     timing_log "Old OLD_ASD_BINARY: $OLD_ASD_BINARY"
     timing_log "Old node: $MIXED_FAIL_OPEN_OLD_NODE"
     timing_log "Old image: ${MIXED_FAIL_OPEN_OLD_IMAGE:-"(default timing image)"}"
     timing_log "Sync threshold: ${MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS} ms"
+    timing_log "Required index: $MIXED_FAIL_OPEN_INDEX"
 
     timing_teardown
-    mixed_fail_open_prepare_dirs
+    smd_seed_identical_sindex "$MIXED_FAIL_OPEN_INDEX"
     mixed_fail_open_set_binaries || return 1
 
     export SMD_DATA_DIR
@@ -1555,8 +1558,17 @@ test_mixed_fail_open() {
         fi
     done
 
+    # Content-integrity check (independent of the timing check above): the
+    # seeded index must survive on every node, old or new. This is what
+    # catches the lightweight cv_key-only wipe when MIXED_FAIL_OPEN_OLD_NODE
+    # puts the old binary in an NPR slot (1 or 2) instead of the default
+    # principal slot (3).
+    for node in 1 2 3; do
+        smd_check_sindex_survived "$node" "$MIXED_FAIL_OPEN_INDEX" "$MIXED_FAIL_OPEN_WAIT_SECONDS" || failed=1
+    done
+
     if [ $failed -eq 0 ]; then
-        timing_log "PASS: mixed-version fail-open sync wait completed promptly"
+        timing_log "PASS: mixed-version fail-open sync wait completed promptly and SMD was not wiped"
         timing_teardown
         return 0
     fi
@@ -1675,6 +1687,155 @@ test_mixed_dirty_rejoin() {
     }
 
     timing_teardown
+}
+
+# Test that a NEW-version principal talking to OLD-version NPRs does not wipe
+# their SMD when the data is already identical / converged.
+#
+# This is the inverse topology from mixed-dirty-rejoin: there, the OLD binary
+# is always principal (node 3, highest node-id) and the NEW binary is the lone
+# NPR, so the NPR side never has to interpret a message it doesn't understand.
+# Here node 3 runs the NEW binary (principal) and nodes 1/2 run the OLD binary
+# (NPRs). All three nodes are pre-seeded with byte-identical sindex.smd, so on
+# cluster formation the principal has no legitimate need to resend the full
+# item set to NPRs that already match -- exactly the condition the "selective
+# FULL_FROM_PR broadcast" perf optimization targets with a lightweight
+# cv_key-only stand-in message.
+#
+# An old NPR that doesn't understand the stand-in sees an empty payload with
+# a new committed key and treats it as an authoritative "replace all", wiping
+# its (already-correct) local item to a bare header. This test asserts the
+# seeded item survives on the disk-persisted SMD of both old NPRs, not just
+# that sync completes -- mixed-fail-open only checks the latter.
+mixed_principal_wipe_set_binaries() {
+    ASD_BINARY_NODE1="$OLD_ASD_BINARY"
+    ASD_BINARY_NODE2="$OLD_ASD_BINARY"
+    ASD_BINARY_NODE3="$ASD_BINARY"
+
+    export ASD_BINARY_NODE1 ASD_BINARY_NODE2 ASD_BINARY_NODE3
+}
+
+smd_seed_identical_sindex() {
+    local index_name=$1
+
+    mixed_fail_open_prepare_dirs
+
+    timing_log "Seeding identical, already-converged sindex SMD on all three nodes: $index_name"
+
+    INDEX_NAME="$index_name" SMD_DATA_DIR="$SMD_DATA_DIR" python3 << 'EOF'
+import json
+import os
+
+base_dir = os.environ["SMD_DATA_DIR"]
+index_name = os.environ["INDEX_NAME"]
+cv_key = 0xABCD
+
+data = [
+    [cv_key, 1],
+    {
+        "key": "test||repro_bin|.|S",
+        "value": index_name,
+        "generation": 1,
+        "timestamp": 1700000000000,
+    },
+]
+
+for node in (1, 2, 3):
+    path = os.path.join(base_dir, f"node{node}", "smd", "sindex.smd")
+    with open(path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+EOF
+}
+
+mixed_principal_wipe_seed_smd() {
+    timing_log "Node 3 (new binary, principal) / nodes 1,2 (old binary, NPRs)"
+    smd_seed_identical_sindex "$MIXED_PRINCIPAL_WIPE_INDEX"
+}
+
+# Waits for a node's initial SMD sync to finish, then asserts a previously
+# seeded sindex name still appears in its on-disk sindex.smd. Shared by
+# mixed-principal-wipe and mixed-fail-open.
+smd_check_sindex_survived() {
+    local node=$1
+    local index_name=$2
+    local timeout=${3:-60}
+    local elapsed=0
+
+    timing_log "Waiting for initial SMD sync on node $node..."
+
+    while [ $elapsed -lt "$timeout" ]; do
+        if docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs "aerospike-${node}" 2>&1 \
+                | grep -q "initial SMD sync done"; then
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ $elapsed -ge "$timeout" ]; then
+        timing_log "FAIL: node $node never logged initial SMD sync done within ${timeout}s"
+        return 1
+    fi
+
+    # Give the async commit-to-disk a moment to persist post-sync state.
+    sleep 3
+
+    local on_disk
+    on_disk=$(docker exec "smd-timing-aerospike-${node}" cat /opt/aerospike/smd/sindex.smd 2>&1)
+
+    if echo "$on_disk" | grep -q "$index_name"; then
+        timing_log "PASS: node $node retained $index_name on disk: $on_disk"
+        return 0
+    fi
+
+    timing_log "FAIL: node $node lost $index_name -- on-disk sindex.smd: $on_disk"
+    return 1
+}
+
+test_mixed_principal_wipe() {
+    mixed_fail_open_validate_binaries || return 1
+
+    if [ -n "$MIXED_FAIL_OPEN_OLD_IMAGE" ]; then
+        timing_log "ERROR: mixed-principal-wipe requires OLD_ASD_BINARY to run in the timing image for old nodes 1,2."
+        timing_log "Unset MIXED_FAIL_OPEN_OLD_IMAGE or add a compose override."
+        return 1
+    fi
+
+    MIXED_PRINCIPAL_WIPE_INDEX="${MIXED_PRINCIPAL_WIPE_INDEX:-idx_mixed_principal_wipe}"
+
+    timing_log "=== Mixed-Version New-Principal / Old-NPR Wipe Regression ==="
+    timing_log "New ASD_BINARY (principal, node 3): $ASD_BINARY"
+    timing_log "Old OLD_ASD_BINARY (NPRs, nodes 1,2): $OLD_ASD_BINARY"
+    timing_log "Required index: $MIXED_PRINCIPAL_WIPE_INDEX"
+
+    timing_teardown
+    mixed_principal_wipe_seed_smd
+    mixed_principal_wipe_set_binaries
+
+    export SMD_DATA_DIR
+    docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" up -d 2>&1 | tail -5 || true
+
+    local wall_ms
+    wall_ms=$(timing_wait_cluster 3 120)
+
+    if [ "$wall_ms" = "-1" ]; then
+        timing_log "FAIL: mixed-version cluster did not form"
+        return 1
+    fi
+
+    local failed=0
+    for node in 1 2; do
+        smd_check_sindex_survived "$node" "$MIXED_PRINCIPAL_WIPE_INDEX" "${MIXED_PRINCIPAL_WIPE_WAIT_SECONDS:-60}" || failed=1
+    done
+
+    if [ $failed -eq 0 ]; then
+        timing_log "PASS: mixed-version new-principal sync did not wipe old NPRs' SMD"
+        timing_teardown
+        return 0
+    fi
+
+    timing_log "Containers left running for inspection. Check logs with: docker compose -f $TIMING_COMPOSE -p $TIMING_PROJECT logs"
+    return 1
 }
 
 # Test that an authoritative FULL_FROM_PR with zero items (principal DB empty,
@@ -2376,6 +2537,9 @@ case "${1:-all}" in
     mixed-dirty-rejoin)
         test_mixed_dirty_rejoin
         ;;
+    mixed-principal-wipe)
+        test_mixed_principal_wipe
+        ;;
     empty-authoritative-full)
         test_empty_authoritative_full
         ;;
@@ -2428,7 +2592,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|mixed-principal-wipe|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2442,6 +2606,7 @@ case "${1:-all}" in
         echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
   echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
+  echo "  mixed-principal-wipe - Test new-principal + old-NPR sync doesn't wipe already-converged SMD"
   echo "  empty-authoritative-full - Test authoritative empty FULL_FROM_PR clears stale NPR items (SERVER-209)"
   echo "  all         - Run all correctness tests"
         echo ""
