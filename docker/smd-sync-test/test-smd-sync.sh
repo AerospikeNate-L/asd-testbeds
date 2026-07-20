@@ -1761,20 +1761,33 @@ smd_check_sindex_survived() {
     local timeout=${3:-60}
     local elapsed=0
 
-    timing_log "Waiting for initial SMD sync on node $node..."
+    # An OLD_ASD_BINARY node predates the "initial SMD sync done" log line
+    # entirely (it's SERVER-209 code) - waiting for it here always times out,
+    # masking whatever this function actually checks (on-disk content) behind
+    # a guaranteed-false timing failure. Every caller that puts the old binary
+    # on a checked node (mixed-fail-open with the old node in an NPR slot,
+    # mixed-principal-wipe checking the old NPRs) hit exactly this.
+    local node_binary_var="ASD_BINARY_NODE${node}"
 
-    while [ $elapsed -lt "$timeout" ]; do
-        if docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs "aerospike-${node}" 2>&1 \
-                | grep -q "initial SMD sync done"; then
-            break
+    if [ -n "$OLD_ASD_BINARY" ] && [ "${!node_binary_var}" = "$OLD_ASD_BINARY" ]; then
+        timing_log "Node $node runs OLD_ASD_BINARY - skipping sync-done log wait, just settling."
+        sleep 10
+    else
+        timing_log "Waiting for initial SMD sync on node $node..."
+
+        while [ $elapsed -lt "$timeout" ]; do
+            if docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs "aerospike-${node}" 2>&1 \
+                    | grep -q "initial SMD sync done"; then
+                break
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+
+        if [ $elapsed -ge "$timeout" ]; then
+            timing_log "FAIL: node $node never logged initial SMD sync done within ${timeout}s"
+            return 1
         fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-
-    if [ $elapsed -ge "$timeout" ]; then
-        timing_log "FAIL: node $node never logged initial SMD sync done within ${timeout}s"
-        return 1
     fi
 
     # Give the async commit-to-disk a moment to persist post-sync state.
