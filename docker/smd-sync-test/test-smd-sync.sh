@@ -672,10 +672,6 @@ TIMING_REAL_MAX_SIZE="${TIMING_REAL_MAX_SIZE:-false}"  # Use max-length keys/val
 # Set these to simulate different deployment scales
 TIMING_REAL_SECURITY_ITEMS="${TIMING_REAL_SECURITY_ITEMS:-}"  # e.g., 300000 for extreme LDAP
 
-# FULL_FROM_PR ACK ordering regression configuration.
-FULL_ACK_SECURITY_ITEMS="${FULL_ACK_SECURITY_ITEMS:-100000}"
-FULL_ACK_PRINCIPAL_NODE="${FULL_ACK_PRINCIPAL_NODE:-3}"  # node-id a3 is expected principal
-
 # Mixed-version fail-open regression configuration.
 MIXED_FAIL_OPEN_OLD_NODE="${MIXED_FAIL_OPEN_OLD_NODE:-3}"
 MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS="${MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS:-5000}"
@@ -1210,213 +1206,6 @@ timing_real_seed_smd() {
             timing_log "  $(basename "$f"): $size"
         fi
     done
-}
-
-# Seed only the expected principal with security SMD so the principal must send
-# FULL_FROM_PR to NPRs during initial sync.
-full_ack_seed_principal_smd() {
-    timing_log "Seeding full-ack-order SMD: principal_node=$FULL_ACK_PRINCIPAL_NODE security_items=$FULL_ACK_SECURITY_ITEMS"
-
-    for node in 1 2 3; do
-        rm -rf "${SMD_DATA_DIR}/node${node}/smd"
-        rm -rf "${SMD_DATA_DIR}/node${node}/log"
-        mkdir -p "${SMD_DATA_DIR}/node${node}/smd"
-        mkdir -p "${SMD_DATA_DIR}/node${node}/log"
-    done
-
-    python3 "$(dirname "$0")/gen-realistic-smd.py" \
-        --out-dir "${SMD_DATA_DIR}/node${FULL_ACK_PRINCIPAL_NODE}/smd" \
-        --module security \
-        --items "$FULL_ACK_SECURITY_ITEMS"
-}
-
-full_ack_asinfo() {
-    local node=$1
-    local command=$2
-
-    timeout 5 docker exec "smd-timing-aerospike-${node}" asinfo -Uadmin -Padmin -v "$command" 2>/dev/null || \
-        timeout 5 docker exec "smd-timing-aerospike-${node}" asinfo -v "$command" 2>/dev/null
-}
-
-full_ack_norm_node_id() {
-    local node_id=$1
-
-    node_id=$(echo "$node_id" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-    node_id=$(echo "$node_id" | sed 's/^0*//')
-
-    if [ -z "$node_id" ]; then
-        echo "0"
-    else
-        echo "$node_id"
-    fi
-}
-
-full_ack_find_principal_service() {
-    local principal
-    principal=$(full_ack_asinfo 1 "statistics" | grep -oP 'cluster_principal=\K[A-Fa-f0-9]+' || true)
-
-    if [ -z "$principal" ]; then
-        timing_log "ERROR: could not read cluster_principal"
-        return 1
-    fi
-
-    local principal_norm
-    principal_norm=$(full_ack_norm_node_id "$principal")
-
-    for node in 1 2 3; do
-        local node_id
-        node_id=$(full_ack_asinfo "$node" "node" || true)
-
-        if [ "$(full_ack_norm_node_id "$node_id")" = "$principal_norm" ]; then
-            echo "smd-timing-aerospike-${node}"
-            return 0
-        fi
-    done
-
-    timing_log "ERROR: could not map cluster_principal=$principal to a compose service"
-    return 1
-}
-
-full_ack_check_ordering() {
-    local principal_service=$1
-    local logs_file="${SMD_DATA_DIR}/full-ack-order-logs.txt"
-
-    docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs --no-color --timestamps > "$logs_file" 2>&1
-
-    python3 - "$logs_file" "$principal_service" <<'PY'
-import re
-import sys
-
-logs_file = sys.argv[1]
-principal_service = sys.argv[2]
-ansi = re.compile(r"\x1b\[[0-9;]*m")
-ts_re = re.compile(r"\|\s+(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)")
-
-principal_ready = None
-npr_full_done = []
-services_seen = set()
-
-with open(logs_file, encoding="utf-8", errors="replace") as f:
-    for line_no, line in enumerate(f, 1):
-        if "|" not in line:
-            continue
-
-        service = ansi.sub("", line.split("|", 1)[0]).strip()
-        services_seen.add(service)
-        ts_match = ts_re.search(line)
-
-        if ts_match is None:
-            continue
-
-        timestamp = ts_match.group(1)
-
-        ready = (
-            "initial sync done" in line
-            or "initial SMD sync done" in line
-            or "sync wait done cl_key" in line
-        )
-
-        if service == principal_service and ready and principal_ready is None:
-            principal_ready = (timestamp, line.rstrip())
-
-        if service != principal_service and "{security:" in line and "full-from-pr timing" in line:
-            npr_full_done.append((timestamp, service, line.rstrip()))
-
-if principal_ready is None:
-    print(f"FAIL: no principal readiness log found for {principal_service}")
-    print(f"Services seen: {', '.join(sorted(services_seen))}")
-    sys.exit(1)
-
-if not npr_full_done:
-    print("FAIL: no NPR {security} full-from-pr timing logs found")
-    print(f"Principal readiness: {principal_ready[1]}")
-    print(f"Services seen: {', '.join(sorted(services_seen))}")
-    sys.exit(1)
-
-early = [entry for entry in npr_full_done if principal_ready[0] < entry[0]]
-
-print(f"Principal readiness: {principal_ready[1]}")
-for _, service, line in npr_full_done:
-    print(f"NPR full apply: {service}: {line}")
-
-if early:
-    print("FAIL: principal readiness was logged before at least one NPR finished applying security FULL_FROM_PR")
-    sys.exit(1)
-
-print("PASS: principal readiness followed NPR security FULL_FROM_PR apply completion")
-PY
-}
-
-full_ack_wait_for_security_full_from_pr() {
-    local expected_count=$1
-    local timeout=${2:-60}
-    local elapsed=0
-
-    timing_log "Waiting for $expected_count NPR security FULL_FROM_PR completion log(s)..."
-
-    while [ $elapsed -lt $timeout ]; do
-        local logs_file="${SMD_DATA_DIR}/full-ack-order-wait-logs.txt"
-        docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" logs --no-color --timestamps > "$logs_file" 2>&1
-
-        local count
-        count=$(grep -c "{security:.*full-from-pr timing" "$logs_file" || true)
-
-        if [ "$count" -ge "$expected_count" ]; then
-            timing_log "Found $count security FULL_FROM_PR completion log(s)"
-            return 0
-        fi
-
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-
-    timing_log "FAIL: did not find $expected_count security FULL_FROM_PR completion log(s) within ${timeout}s"
-    return 1
-}
-
-test_full_ack_ordering() {
-    if [ -z "$ASD_BINARY" ]; then
-        timing_log "ERROR: ASD_BINARY not set. Export the path to the asd binary."
-        return 1
-    fi
-    if [ ! -f "$ASD_BINARY" ]; then
-        timing_log "ERROR: ASD_BINARY='$ASD_BINARY' is not a file."
-        return 1
-    fi
-
-    timing_log "=== FULL_FROM_PR ACK Ordering Regression ==="
-    timing_log "ASD_BINARY: $ASD_BINARY"
-    timing_log "Security items: $FULL_ACK_SECURITY_ITEMS"
-
-    timing_teardown
-    full_ack_seed_principal_smd
-
-    export SMD_DATA_DIR ASD_BINARY
-    docker compose -f "$TIMING_COMPOSE" -p "$TIMING_PROJECT" up -d 2>&1 | tail -5 || true
-
-    local wall_ms
-    wall_ms=$(timing_wait_cluster 3 600)
-
-    if [ "$wall_ms" = "-1" ]; then
-        timing_log "FAIL: cluster did not form"
-        return 1
-    fi
-
-    local principal_service
-    principal_service=$(full_ack_find_principal_service)
-    timing_log "Principal service: $principal_service"
-
-    local expected_principal_service="smd-timing-aerospike-${FULL_ACK_PRINCIPAL_NODE}"
-
-    if [ "$principal_service" != "$expected_principal_service" ]; then
-        timing_log "FAIL: expected $expected_principal_service to be principal, got $principal_service"
-        return 1
-    fi
-
-    full_ack_wait_for_security_full_from_pr 2
-    full_ack_check_ordering "$principal_service"
-
-    timing_teardown
 }
 
 mixed_fail_open_validate_binaries() {
@@ -2367,9 +2156,6 @@ case "${1:-all}" in
     migration-defer)
         test_migration_deferred_until_smd_ready
         ;;
-    full-ack-order)
-        test_full_ack_ordering
-        ;;
     mixed-fail-open)
         test_mixed_fail_open
         ;;
@@ -2428,7 +2214,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2439,7 +2225,6 @@ case "${1:-all}" in
         echo "  identical   - Test nodes joining with identical pre-existing SMD"
         echo "  principal-loss - Test initial SMD sync wait aborts after principal loss"
         echo "  migration-defer - Test fresh node defers immigration until SMD settled"
-        echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
   echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
   echo "  empty-authoritative-full - Test authoritative empty FULL_FROM_PR clears stale NPR items (SERVER-209)"

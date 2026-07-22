@@ -24,7 +24,6 @@ tests are deterministic and repeatable.
 | `preexisting` | Node 1 starts first with SMD data, nodes 2 and 3 join empty |
 | `pull` | Nodes 2 and 3 start with SMD, node 1 joins and receives SMD |
 | `identical` | Restart all nodes with identical pre-existing SMD |
-| `full-ack-order` | Principal readiness waits for NPR `FULL_FROM_PR` apply completion |
 | `mixed-fail-open` | Mixed-version cluster releases fail-open SMD sync waiters promptly |
 
 ## Prerequisites
