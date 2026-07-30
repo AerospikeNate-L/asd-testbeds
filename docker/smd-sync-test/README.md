@@ -26,6 +26,7 @@ tests are deterministic and repeatable.
 | `identical` | Restart all nodes with identical pre-existing SMD |
 | `full-ack-order` | Principal readiness waits for NPR `FULL_FROM_PR` apply completion |
 | `mixed-fail-open` | Mixed-version cluster releases fail-open SMD sync waiters promptly |
+| `mixed-principal-wipe` | New-version principal + old-version NPRs with identical pre-existing SMD: NPRs must not have their SMD wiped by the lightweight cv_key-only broadcast optimization |
 
 ## Prerequisites
 
@@ -122,6 +123,22 @@ the compatibility fail-open path and verifies new-version nodes complete
 `as_smd_cluster_changed_sync()` promptly instead of waiting for an unrelated
 readiness probe. If the old binary was built for a different distro, set
 `MIXED_FAIL_OPEN_OLD_IMAGE` to run node 3 with a compatible image.
+
+### New-Principal / Old-NPR Wipe (`mixed-principal-wipe`)
+
+Runs a mixed-version cluster with the **new** binary (`ASD_BINARY`) forced onto
+node 3 (deterministic principal) and the **old** binary (`OLD_ASD_BINARY`) onto
+nodes 1 and 2 (NPRs). All three nodes are pre-seeded with byte-identical
+`sindex.smd` before start, so the principal has no legitimate need to resend
+the full item set -- exactly the condition where a lightweight cv_key-only
+broadcast optimization would fire instead of a full payload. An old NPR that
+doesn't understand that stand-in message can treat it as an authoritative
+"replace all" and wipe an item it already had correctly. This test asserts the
+seeded index survives on-disk on both old NPRs after sync, not just that sync
+completes.
+
+Requires `OLD_ASD_BINARY` set to a binary that predates the selective
+`FULL_FROM_PR` broadcast optimization (SERVER-209).
 
 ## Configuration Files
 
