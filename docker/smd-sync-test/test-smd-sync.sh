@@ -1565,6 +1565,62 @@ test_mixed_fail_open() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# module-skew (SERVER-1336)
+#
+# A principal whose build LACKS an SMD module this node has never names that
+# module, so it never sends the message that settles it and the NPR's initial
+# sync gate never latches. No released build can produce this at compat >= 16
+# (masking shipped mid-compat-15), so the "old" node here is a purpose-built
+# variant: current source with the masking SMD module not loaded, compat id
+# left at 16 - protocol-identical to a build that lacks the module.
+#
+# Build the variant (from aerospike-server/, EE checkout alongside):
+#   1. In aerospike-server-enterprise/as/src/base/masking_ee.c, replace
+#        as_smd_module_load(AS_SMD_MODULE_MASKING, smd_accept_cb, NULL, NULL);
+#      with
+#        (void)smd_accept_cb;
+#      The cast is required - dropping the call orphans the static and -Werror
+#      rejects the build.
+#   2. make +ee -j$(nproc) && cp target/Linux-x86_64/bin/asd \
+#        asd-testbeds/bin/asd-no-masking-compat16
+#   3. Restore masking_ee.c.
+#
+# Node 3 holds the highest node-id, so SKEW_OLD_NODE=3 puts the module-lacking
+# build in the principal seat - the SERVER-1336 path. SKEW_OLD_NODE=1|2 instead
+# exercises the principal-side node_lacks path (SERVER-209 / PR #1510) at
+# compat 16, which mixed-fail-open only reaches at compat 15.
+#
+# Expected: without the fix the new-version nodes wedge indefinitely on
+# "still waiting for initial SMD sync"; with it they self-confirm the module
+# after SMD_SKEW_CONFIRM_MS and log
+#   {masking} principal <id> lacks module - self-confirming settle
+SKEW_ASD_BINARY="${SKEW_ASD_BINARY:-$(dirname "$0")/../../bin/asd-no-masking-compat16}"
+SKEW_OLD_NODE="${SKEW_OLD_NODE:-3}"
+SKEW_WAIT_SECONDS="${SKEW_WAIT_SECONDS:-90}"
+# Self-confirm waits SMD_SKEW_CONFIRM_MS (4 x SMD_RETRY_MS = 12s) of principal
+# silence, so this threshold is necessarily looser than mixed-fail-open's.
+SKEW_SYNC_THRESHOLD_MS="${SKEW_SYNC_THRESHOLD_MS:-30000}"
+
+test_module_skew() {
+    timing_log "=== Compat-equal SMD Module Skew (SERVER-1336) ==="
+
+    if [ ! -f "$SKEW_ASD_BINARY" ]; then
+        timing_log "ERROR: SKEW_ASD_BINARY='$SKEW_ASD_BINARY' not found."
+        timing_log "       Build the module-lacking variant - see comment above test_module_skew()."
+        return 1
+    fi
+
+    timing_log "New ASD_BINARY:      $ASD_BINARY"
+    timing_log "Module-lacking node: $SKEW_ASD_BINARY (node $SKEW_OLD_NODE)"
+
+    OLD_ASD_BINARY="$SKEW_ASD_BINARY" \
+    MIXED_FAIL_OPEN_OLD_NODE="$SKEW_OLD_NODE" \
+    MIXED_FAIL_OPEN_WAIT_SECONDS="$SKEW_WAIT_SECONDS" \
+    MIXED_FAIL_OPEN_SYNC_THRESHOLD_MS="$SKEW_SYNC_THRESHOLD_MS" \
+        test_mixed_fail_open
+}
+
 mixed_dirty_rejoin_set_binaries() {
     # Nodes 2 and 3 are old-version nodes; node 3 is the deterministic principal.
     ASD_BINARY_NODE1="$ASD_BINARY"
@@ -2373,6 +2429,9 @@ case "${1:-all}" in
     mixed-fail-open)
         test_mixed_fail_open
         ;;
+    module-skew)
+        test_module_skew
+        ;;
     mixed-dirty-rejoin)
         test_mixed_dirty_rejoin
         ;;
@@ -2428,7 +2487,7 @@ case "${1:-all}" in
         timing_teardown
         ;;
     *)
-        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
+        echo "Usage: $0 {basic|auth|rejoin|preexisting|pull|identical|principal-loss|migration-defer|full-ack-order|mixed-fail-open|module-skew|mixed-dirty-rejoin|empty-authoritative-full|all|timing|timing-real|timing-conflict|timing-rejoin|show-limits|cleanup|cleanup-full|timing-cleanup}"
         echo ""
         echo "Correctness tests:"
         echo "  basic       - Test SMD sync ordering on fresh cluster"
@@ -2441,6 +2500,7 @@ case "${1:-all}" in
         echo "  migration-defer - Test fresh node defers immigration until SMD settled"
         echo "  full-ack-order - Test principal readiness waits for NPR FULL_FROM_PR apply"
         echo "  mixed-fail-open - Test mixed-version fail-open releases sync waiters"
+        echo "  module-skew     - SERVER-1336: principal lacking an SMD module at equal compat id"
   echo "  mixed-dirty-rejoin - Test dirty new-version NPR waits for old-principal FULL_FROM_PR"
   echo "  empty-authoritative-full - Test authoritative empty FULL_FROM_PR clears stale NPR items (SERVER-209)"
   echo "  all         - Run all correctness tests"
